@@ -1,0 +1,181 @@
+---
+# The official Rust toolchain, pinned, installed with rustup — but NOT as a rustup install in
+# the usual sense. rustup is only the downloader here:
+#
+#   {{ lsp_rust_root }}/cargo/bin/rustup     private; never linked onto PATH
+#   {{ lsp_rust_root }}/rustup/toolchains/…  the toolchain, root-owned
+#   {{ lsp_bin_dir }}/{cargo,rustc,rust-analyzer,…} -> the toolchain's REAL binaries
+#
+# Linking the real binaries (not rustup's shims) is the point. A shim works only for a user
+# whose own ~/.rustup holds a default toolchain; a real binary finds its sysroot from its own
+# location and works for every user and for the daemon, with no environment to set up. The
+# cost: nothing consults rust-toolchain.toml, exactly as with a distro package.
+
+- name: Resolve the toolchain target and paths
+  ansible.builtin.set_fact:
+    _lsp_rust_target: >-
+      {{ lsp_rust_target
+         if (lsp_rust_target | length > 0)
+         else ((lsp_arch_map[ansible_facts['architecture']] ~ '-unknown-linux-gnu')
+               if (ansible_facts['architecture'] in lsp_arch_map) else '') }}
+    _lsp_rustup: "{{ lsp_rust_root }}/cargo/bin/rustup"
+    _lsp_rustup_env:
+      RUSTUP_HOME: "{{ lsp_rust_root }}/rustup"
+      CARGO_HOME: "{{ lsp_rust_root }}/cargo"
+      PATH: "{{ lsp_rust_root }}/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+      # rustup-init refuses to run beside a distro Rust it finds on PATH unless told it is fine.
+      RUSTUP_INIT_SKIP_PATH_CHECK: "yes"
+
+- name: Require a known toolchain target
+  ansible.builtin.assert:
+    that: _lsp_rust_target | length > 0
+    fail_msg: >-
+      No default Rust host triple for {{ ansible_facts['architecture'] }}. Set lsp_rust_target
+      (e.g. armv7-unknown-linux-gnueabihf, or x86_64-unknown-linux-musl on a musl system).
+    quiet: true
+
+- name: Ensure download tools are present
+  ansible.builtin.include_tasks: packages.yml
+  vars:
+    _lsp_pkg_label: download tools
+    _lsp_pkgs: "{{ lsp_download_tools_by_family[ansible_facts['os_family']] | default([]) }}"
+
+# ---- rustup itself -----------------------------------------------------------------------------
+- name: Check for this role's rustup
+  ansible.builtin.stat:
+    path: "{{ _lsp_rustup }}"
+  register: _lsp_rustup_stat
+
+# Not under --check: nothing is downloaded in a dry run.
+- name: Install rustup under the Rust root
+  when:
+    - not _lsp_rustup_stat.stat.exists
+    - not ansible_check_mode
+  block:
+    - name: Create the Rust root
+      ansible.builtin.file:
+        path: "{{ lsp_rust_root }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Create a scratch dir for the download
+      ansible.builtin.tempfile:
+        state: directory
+        prefix: rustup-dl.
+      register: _lsp_rustup_tmp
+
+    # The rustup-init BINARY, not the sh.rustup.rs script: one download, one optional checksum,
+    # and no shell script deciding things on our behalf. use_netrc: see python.yml.
+    - name: Download rustup-init
+      ansible.builtin.get_url:
+        url: "{{ lsp_rustup_init_url }}/{{ _lsp_rust_target }}/rustup-init"
+        dest: "{{ _lsp_rustup_tmp.path }}/rustup-init"
+        checksum: "{{ lsp_rustup_init_checksum | default(omit, true) }}"
+        mode: "0755"
+        use_netrc: false
+
+    # --default-toolchain none: install rustup only; the toolchain step below owns versions.
+    # --no-modify-path: no shell rc is touched (nothing here belongs on PATH via a profile).
+    # umask 022: see python.yml — root-only files would lock every other user out.
+    - name: Run rustup-init
+      ansible.builtin.shell:
+        cmd: >-
+          umask 022 &&
+          {{ (_lsp_rustup_tmp.path ~ '/rustup-init') | quote }} -y --no-modify-path
+          --profile minimal --default-toolchain none
+          --default-host {{ _lsp_rust_target | quote }}
+      environment: "{{ _lsp_rustup_env }}"
+      changed_when: true
+  always:
+    - name: Remove the scratch dir
+      ansible.builtin.file:
+        path: "{{ _lsp_rustup_tmp.path }}"
+        state: absent
+      when: _lsp_rustup_tmp.path is defined
+
+# ---- the toolchain -----------------------------------------------------------------------------
+- name: List the installed toolchains
+  ansible.builtin.command:
+    argv: ["{{ _lsp_rustup }}", toolchain, list]
+  environment: "{{ _lsp_rustup_env }}"
+  register: _lsp_rustup_toolchains
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+# Lines look like "1.100.0-x86_64-unknown-linux-gnu" or "stable-x86_64-… (active, default)".
+- name: Work out whether the requested toolchain is installed
+  ansible.builtin.set_fact:
+    _lsp_rust_toolchain_present: >-
+      {{ (_lsp_rustup_toolchains.rc | default(1)) == 0
+         and (_lsp_rustup_toolchains.stdout | default('')
+              is search('(?m)^' ~ (lsp_rust_toolchain | regex_escape) ~ '(-| |$)')) }}
+
+- name: Install the Rust toolchain {{ lsp_rust_toolchain }}
+  ansible.builtin.shell:
+    cmd: >-
+      umask 022 &&
+      {{ _lsp_rustup | quote }} toolchain install {{ lsp_rust_toolchain | quote }}
+      --profile minimal --no-self-update
+      {{ lsp_rust_components | map('quote') | map('regex_replace', '^', '--component ') | join(' ') }}
+  environment: "{{ _lsp_rustup_env }}"
+  changed_when: true
+  when: not (_lsp_rust_toolchain_present | bool)
+
+# Covers a component added to lsp_rust_components after the toolchain was installed. Cheap and
+# offline when there is nothing to add. rustup reports on stderr: "component X is up to date",
+# or "downloading component X" (1.29; older releases also print "installing component").
+- name: Ensure the toolchain has every requested component
+  ansible.builtin.shell:
+    cmd: >-
+      umask 022 &&
+      {{ _lsp_rustup | quote }} component add --toolchain {{ lsp_rust_toolchain | quote }}
+      {{ lsp_rust_components | map('quote') | join(' ') }}
+  environment: "{{ _lsp_rustup_env }}"
+  register: _lsp_rustup_components
+  changed_when: (_lsp_rustup_components.stderr | default('')) is search('(downloading|installing) component')
+  when: _lsp_rust_toolchain_present | bool
+
+# Channel names only, and only on request: a host stays on what it first installed until then.
+- name: Update the toolchain's channel
+  ansible.builtin.shell:
+    cmd: "umask 022 && {{ _lsp_rustup | quote }} update {{ lsp_rust_toolchain | quote }} --no-self-update"
+  environment: "{{ _lsp_rustup_env }}"
+  register: _lsp_rustup_update
+  changed_when: "'unchanged' not in (_lsp_rustup_update.stdout | default(''))"
+  when:
+    - lsp_rust_update | bool
+    - _lsp_rust_toolchain_present | bool
+
+# ---- onto PATH ---------------------------------------------------------------------------------
+# Ask rustup where the toolchain's rustc REALLY is instead of rebuilding the directory name.
+- name: Locate the toolchain's binaries
+  ansible.builtin.command:
+    argv: ["{{ _lsp_rustup }}", which, --toolchain, "{{ lsp_rust_toolchain }}", rustc]
+  environment: "{{ _lsp_rustup_env }}"
+  register: _lsp_rustc_real
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: Link the toolchain into the command dir
+  when: (_lsp_rustc_real.rc | default(1)) == 0
+  block:
+    - name: List the toolchain's commands
+      ansible.builtin.find:
+        paths: "{{ _lsp_rustc_real.stdout | trim | dirname }}"
+        file_type: any
+      register: _lsp_rust_bins
+
+    # cargo, rustc, rustdoc, rust-analyzer, rustfmt, cargo-fmt, cargo-clippy, clippy-driver, …
+    - name: Link each toolchain command
+      ansible.builtin.file:
+        src: "{{ item.path }}"
+        dest: "{{ lsp_bin_dir }}/{{ item.path | basename }}"
+        state: link
+        force: true
+      loop: "{{ _lsp_rust_bins.files | default([]) | sort(attribute='path') }}"
+      loop_control:
+        label: "{{ item.path | basename }}"

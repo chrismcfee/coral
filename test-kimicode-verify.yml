@@ -1,0 +1,158 @@
+---
+# Post-run assertions for test-kimicode.yml. Read-only: proves the things the install play cannot,
+# because they are properties of the RUNNING system rather than of the tasks.
+#
+#     ansible-playbook -i inventory.yml test-kimicode-verify.yml --limit <host>
+- name: Verify the Kimi Code agent path on a live host
+  hosts: all
+  become: true
+  gather_facts: true
+  vars:
+    _home: "{{ paseo_home_dir | default('/var/lib/paseo') }}"
+    _user: "{{ paseo_user | default('paseo') }}"
+    _state: "{{ paseo_state_dir | default('/var/lib/paseo/.paseo') }}"
+    _kimi: "{{ paseo_kimicode_installed_bin | default('/var/lib/paseo/.kimi-code/bin/kimi') }}"
+    _paseo: "{{ paseo_bin | default('/var/lib/paseo/.npm-global/bin/paseo') }}"
+    _env_file: "{{ paseo_env_file | default('/etc/paseo/paseo.env') }}"
+  tasks:
+    - name: Read the installed Kimi Code version (the role's own idempotency probe)
+      ansible.builtin.command:
+        argv: ["{{ _kimi }}", "--version"]
+      environment:
+        HOME: "{{ _home }}"
+        KIMI_CODE_NO_AUTO_UPDATE: "1"
+      become_user: "{{ _user }}"
+      register: ver
+      changed_when: false
+
+    - name: Report the installed version
+      ansible.builtin.debug:
+        msg: "kimi {{ ver.stdout | trim }} at {{ _kimi }}"
+
+    # The installer rewrites the user's shell rc unless told not to. The role passes
+    # KIMI_NO_MODIFY_PATH; this proves it took.
+    - name: Check the installer left the shell rc files alone
+      ansible.builtin.shell: >-
+        grep -l 'kimi-code' {{ _home }}/.bashrc {{ _home }}/.bash_profile {{ _home }}/.profile
+        {{ _home }}/.zshrc 2>/dev/null || true
+      register: rc_hits
+      changed_when: false
+
+    - name: Assert no shell rc was modified
+      ansible.builtin.assert:
+        that: rc_hits.stdout | trim | length == 0
+        fail_msg: "the Kimi installer edited: {{ rc_hits.stdout }}"
+        success_msg: "shell rc files untouched"
+
+    # The load-bearing one: PATH must have no empty element, since an empty element means CWD.
+    - name: Read the PATH actually baked into the unit
+      ansible.builtin.shell: >-
+        set -o pipefail;
+        {% if ansible_service_mgr == 'systemd' %}
+        systemctl show paseo -p Environment --value
+        {% else %}
+        grep -E '^\s*(export\s+)?PASEO_PATH=' /etc/init.d/paseo /etc/conf.d/paseo 2>/dev/null | head -1
+        {% endif %}
+      args: {executable: /bin/bash}
+      register: unit_path
+      changed_when: false
+
+    - name: Assert the daemon PATH has no empty element and includes the Kimi bin dir
+      ansible.builtin.assert:
+        that:
+          - "'::' not in unit_path.stdout"
+          - "'.kimi-code/bin' in unit_path.stdout"
+        fail_msg: "daemon PATH is wrong: {{ unit_path.stdout }}"
+        success_msg: "daemon PATH OK: {{ unit_path.stdout }}"
+
+    - name: Read config.json
+      ansible.builtin.slurp:
+        src: "{{ _state }}/config.json"
+      register: cfg
+
+    # `extends: acp` + `label` + an absolute `command` are each required for Kimi to exist as a
+    # provider at all; a `command`-only entry is accepted and then silently ignored.
+    - name: Assert the provider entry is a complete custom ACP provider and nothing was clobbered
+      ansible.builtin.assert:
+        that:
+          - (cfg.content | b64decode | from_json).agents.providers.kimi.extends == 'acp'
+          - (cfg.content | b64decode | from_json).agents.providers.kimi.label | length > 0
+          - (cfg.content | b64decode | from_json).agents.providers.kimi.command | length == 2
+          - (cfg.content | b64decode | from_json).agents.providers.kimi.command[0] is match('^/')
+          - (cfg.content | b64decode | from_json).agents.providers.kimi.command[1] == 'acp'
+          - (cfg.content | b64decode | from_json).daemon.auth.password is defined
+          - (cfg.content | b64decode | from_json).daemon.listen is defined
+        fail_msg: "agents.providers.kimi is incomplete, or config.json lost a key during the merge"
+        success_msg: "config.json intact (kimi registered as an ACP provider, password hash preserved)"
+
+    - name: Confirm the daemon came up
+      ansible.builtin.command: "systemctl is-active paseo"
+      register: active
+      changed_when: false
+      failed_when: false
+      when: ansible_service_mgr == 'systemd'
+
+    - name: Report daemon state
+      ansible.builtin.debug:
+        msg: "paseo service: {{ active.stdout | default('n/a — not systemd') }}"
+
+    # The real availability probe: ask the RUNNING daemon which providers it found. This is the
+    # check that catches a registration the schema accepts but the registry ignores.
+    - name: Ask the daemon which providers it reports
+      ansible.builtin.command:
+        argv: ["{{ _paseo }}", "daemon", "status", "--json"]
+      environment:
+        HOME: "{{ _home }}"
+        PASEO_HOME: "{{ _state }}"
+        PATH: "{{ paseo_service_path | default('/var/lib/paseo/.npm-global/bin:/usr/local/bin:/usr/bin:/bin') }}"
+      become_user: "{{ _user }}"
+      register: status
+      changed_when: false
+      failed_when: false
+
+    - name: Parse the provider list
+      ansible.builtin.set_fact:
+        _providers: >-
+          {{ ((status.stdout | from_json).providers | default([]))
+             if (status.rc == 0 and (status.stdout | trim) is match('^[{]')) else [] }}
+
+    - name: Assert the daemon reports kimi as an available provider
+      ansible.builtin.assert:
+        that:
+          - _providers | selectattr('provider', 'equalto', 'kimi') | list | length == 1
+          - (_providers | selectattr('provider', 'equalto', 'kimi') | first).available
+        fail_msg: >-
+          The running daemon does not report kimi as available. Providers it does report:
+          {{ _providers | map(attribute='provider') | join(', ') }}
+        success_msg: "daemon reports kimi available"
+      when: _providers | length > 0
+
+    - name: Note when the daemon's provider list could not be read
+      ansible.builtin.debug:
+        msg: >-
+          Could not read a provider list from `paseo daemon status --json` (rc={{ status.rc }}).
+          Older CLIs don't include one; check the provider picker in the Paseo app instead.
+      when: _providers | length == 0
+
+    # Availability ignores auth, so this is the only step that proves the credential works. The
+    # daemon env file is sourced so the KIMI_MODEL_* path is exercised exactly as the daemon would.
+    - name: End-to-end auth check (only meaningful if a credential was deployed or kimi is logged in)
+      ansible.builtin.shell: >-
+        set -a; [ -r '{{ _env_file }}' ] && . '{{ _env_file }}'; set +a;
+        exec '{{ _kimi }}' -p 'reply with exactly: ok'
+      args: {executable: /bin/sh}
+      environment:
+        HOME: "{{ _home }}"
+        KIMI_CODE_NO_AUTO_UPDATE: "1"
+      become_user: "{{ _user }}"
+      register: e2e
+      changed_when: false
+      failed_when: false
+      no_log: true
+      timeout: 180
+
+    - name: Report the auth result
+      ansible.builtin.debug:
+        msg: >-
+          rc={{ e2e.rc | default('?') }} | {{ (e2e.stdout | default('') | trim | truncate(200))
+          if (e2e.rc | default(1)) == 0 else 'FAILED — ' ~ (e2e.stderr | default('') | trim | truncate(300)) }}

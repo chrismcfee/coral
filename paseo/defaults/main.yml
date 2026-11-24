@@ -28,7 +28,12 @@ paseo_bin_dir: "{{ paseo_npm_prefix }}/bin"
 paseo_bin: "{{ paseo_bin_dir }}/paseo"
 
 paseo_cli_package: "@getpaseo/cli"
-paseo_cli_version: ""            # pin a version e.g. "0.1.101"; empty = track latest
+# Empty = track latest: npm upgrades the CLI on EVERY play. Convenient, but Paseo moves fast and has
+# made breaking CLI changes (0.9.0 removed `daemon start --foreground`), so an unpinned fleet picks
+# those up the next time you run the play. Pin e.g. "0.17.4" for a fleet you want reproducible, and
+# bump it deliberately. The role is verified against 0.17.4; the systemd launch command is
+# feature-detected, so both pre- and post-0.9 CLIs work (see paseo_daemon_foreground_command).
+paseo_cli_version: ""
 # The password step runs paseo's own hashDaemonPassword() from inside the installed CLI package via
 # `node`, so it never depends on the broken set-password prompt. This is the common-case path; on
 # lib64 profiles (Gentoo) npm's global root is <prefix>/lib64/node_modules, so install.yml overrides
@@ -85,9 +90,18 @@ paseo_netbird_unit: netbird                       # systemd: <name>.service ; op
 
 # CRITICAL (systemd): `paseo daemon start` is a self-detaching launcher that exits 0.
 # Under Type=simple that gets the real worker SIGTERM'd at launcher exit (KillMode=control-group)
-# — the exact double-detach bug the runbook avoids for OpenRC. We run it in the FOREGROUND so the
-# worker IS the main PID and Restart=on-failure actually supervises it. REVIEW FIX.
-# >>> VERIFY this flag on your build: `paseo daemon start --help` (could be --no-detach / run). <<<
+# — the exact double-detach bug the runbook avoids for OpenRC. We run the daemon in the FOREGROUND
+# so systemd supervises a process that stays alive and Restart=on-failure actually works.
+#
+# HOW to run in the foreground changed in @getpaseo/cli 0.9.0 (verified against the CLI source):
+#   < 0.9.0   `paseo daemon start --foreground`
+#   >= 0.9.0  `paseo daemon run`   — `--foreground` is now a tombstone that exits 1 with
+#             "--foreground was removed. Use paseo daemon run", which crash-loops the unit.
+# Left empty, the role asks the INSTALLED CLI which form it has (tasks/service.yml) and templates
+# the matching one, so an unpinned fleet survives the upgrade and a host pinned below 0.9 still
+# works. Set this only to force a specific sub-command line, e.g. "daemon run".
+paseo_daemon_foreground_command: ""
+# Legacy only: the flag appended to `daemon start` when the installed CLI predates `daemon run`.
 paseo_foreground_flag: "--foreground"
 paseo_restart_sec: 3
 
@@ -149,10 +163,18 @@ paseo_opencode_extra_files: []
 # --- secrets (externalized) --------------------------------------------------------------------
 # Real values for the {env:VAR} placeholders in the sanitized config. Injected into the DAEMON
 # ENVIRONMENT (systemd EnvironmentFile + OpenRC source), so {env:VAR} resolves when Paseo launches
-# OpenCode. PULL FROM VAULT — never put real values here. (You can include PASEO_PASSWORD here too,
-# e.g. for the mcp.paseo loopback block.) Values must be single-line and free of single quotes.
+# OpenCode. PULL FROM VAULT — never put real values here. Values must be single-line and free of
+# single quotes.
 #   paseo_opencode_secrets:
 #     OPENCODE_PROVIDER_TENSORZERO_OPTIONS_APIKEY: "{{ vault_tensorzero_api_key }}"
+#
+# DO NOT use the daemon's own setting names as keys (PASEO_PASSWORD, PASEO_LISTEN, PASEO_HOSTNAMES,
+# PORT, PASEO_RELAY_ENABLED, …). The daemon reads its settings from this same environment, and the
+# two init systems treat those names in opposite ways: under systemd (foreground mode) they
+# OVERRIDE config.json — PASEO_PASSWORD silently replaces the password this role manages — while
+# from @getpaseo/cli 0.9 OpenRC's `daemon start` strips them before any agent sees them. For a
+# bearer the launched agent sends back to Paseo, use a neutral name such as PASEO_TOKEN (see
+# paseo_opencode_mcp_token_env). tasks/service.yml warns if it finds one of these keys.
 paseo_opencode_secrets: {}
 paseo_env_file: /etc/paseo/paseo.env        # root:paseo 0640; loaded by both init systems
 
@@ -168,10 +190,18 @@ paseo_opencode_auth_dest: "{{ paseo_home_dir }}/.local/share/opencode/auth.json"
 # OpenCode MCP client wiring — Direction B (runbook §5), optional
 # =============================================================================
 # Injects only the `mcp.paseo` block into an existing opencode.json (deep-merge, your other
-# config is preserved). oauth:false + {env:PASEO_PASSWORD} per §5; a launched OpenCode reading
-# this also sidesteps bug #914 (§6).
+# config is preserved). oauth:false + a `Bearer {env:<name>}` header per §5; a launched OpenCode
+# reading this also sidesteps bug #914 (§6).
 paseo_manage_opencode_mcp: false
 paseo_opencode_mcp_url: "http://127.0.0.1:6767/mcp/agents"
+# The env var the injected header reads the daemon password from. This used to be hardcoded to
+# PASEO_PASSWORD, which doubles as a daemon setting (see the paseo_opencode_secrets note): in the
+# daemon's environment it overrides the config.json password, and from @getpaseo/cli 0.9 OpenRC's
+# `daemon start` strips it before the agent starts, so {env:PASEO_PASSWORD} resolves to nothing
+# there. PASEO_TOKEN is not special to the daemon, works on both init systems, and is what
+# make-vault.sh and the repo's opencode.jsonc already use. Put the daemon password under this key
+# in paseo_opencode_secrets.
+paseo_opencode_mcp_token_env: "PASEO_TOKEN"
 
 # OpenCode config discovery / fetch
 # Leave paseo_opencode_config_path empty to auto-resolve it on the target (honors OPENCODE_CONFIG,
@@ -207,8 +237,13 @@ paseo_deploy_claude_settings: true          # deploy ~/.claude/settings.json (ne
 # Anthropic ships signed apt/dnf/apk repos too, but not for Gentoo or Arch — the native installer
 # is the only uniform path across all four families this role supports.
 paseo_claude_install_url: "https://claude.ai/install.sh"
-# Pin an exact version e.g. "2.1.212", or a channel: "stable" / "latest". Pinning is STRONGLY
+# Pin an exact version e.g. "2.1.325", or a channel: "stable" / "latest". Pinning is STRONGLY
 # preferred for a fleet — `latest` means two hosts provisioned a day apart run different builds.
+#
+# A channel is only resolved at FIRST install: an installed semver can't be compared to the word
+# "stable", so a host that already has Claude Code is left alone (and DISABLE_AUTOUPDATER below
+# stops it updating itself). To move a fleet forward, either bump an exact pin here — the role
+# then re-pins every host that differs — or run once with -e paseo_claude_upgrade=true.
 paseo_claude_version: "stable"
 paseo_claude_upgrade: false                 # re-pin every play even when already at a good version
 # Installer layout is hardcoded to the user's home; it is not configurable via a flag.
@@ -239,6 +274,9 @@ paseo_claude_secrets: {}
 paseo_verify_claude_credential: true
 # Model used for the 1-token probe. Only matters for the 200 case: a retired name returns 404, which
 # is already classified as "could not verify" rather than a bad key, so this drifting is harmless.
+# Haiku 4.5 is still served. The current cheapest model is `claude-haiku-5-5`, but it thinks by
+# default and this probe (max_tokens: 1) has not been confirmed against it with a real key — switch
+# only after seeing a 200 from it. A gateway that maps other names needs this overridden too.
 paseo_claude_preflight_model: "claude-haiku-4-5-20251001"
 
 # --- settings.json -----------------------------------------------------------------------------
@@ -275,69 +313,104 @@ paseo_seed_claude_onboarding: true
 # =============================================================================
 # Kimi Code: install + register as a Paseo agent provider — dedicated-user mode
 # =============================================================================
-# `kimi` is registered as a custom provider in Paseo (not a builtin like claude/opencode),
-# driven through the ACP bridge (`kimi acp` — JSON-RPC over stdio). Kimi Code speaks ACP
-# natively with 10/12 agent methods implemented: initialize, authenticate, session/new,
-# session/prompt, session/cancel, session/list, and more. No separate bridge needed —
-# Paseo connects directly to the `kimi acp` subprocess.
+# `kimi` is NOT a Paseo builtin (those are claude/codex/copilot/opencode/pi/omp). It is driven over
+# ACP — `kimi acp` speaks JSON-RPC on stdio — and Paseo only offers it once config.json declares a
+# custom provider for it. Everything below was checked against the real tools rather than assumed:
+# the installer script itself, the kimi 2.x binary, Kimi's own docs, and the provider registry of
+# @getpaseo/cli 0.17.4.
 #
-# Off by default: enabling it downloads a ~150 MB binary per host. The official installer
-# is a single-binary distribution with no Node.js requirement.
+# Off by default: enabling it downloads ~62 MB per host (a ~190 MB binary on disk).
 paseo_install_kimicode: false
-paseo_deploy_kimicode_settings: true          # deploy ~/.kimi-code/config.json (needs install)
 
-# --- install (Moonshot's official installer: curl | bash) ---------------------------------------
-# Self-contained single-binary distribution (no Node.js at runtime). Needs bash + curl on the
-# target, outbound HTTPS to code.kimi.com, and ~256 MB free RAM to install.
-# The script always fetches the latest release — there is no explicit version pinning via the
-# installer. For fleet stability, pin the binary path in config.json at the provider level.
+# --- install (Moonshot's official installer: curl | bash) --------------------------------------
+# A single glibc binary (no Node at runtime; musl/Alpine is unsupported) placed at
+# <install_dir>/bin/kimi. Needs bash + (curl or wget) + sha256sum on the target — tar is used when
+# present — and outbound HTTPS to the download host.
+#
+# The download host also decides the REGION Kimi assumes until first login: code.kimi.com writes
+# "mainland-cn" (kimi.com accounts), code.kimi.ai writes "global" (kimi.ai accounts). That only
+# matters for the OAuth login; API-key auth ignores it. For the global channel use
+#   https://code.kimi.ai/kimi-code/install.sh
 paseo_kimicode_install_url: "https://code.kimi.com/kimi-code/install.sh"
-paseo_kimicode_upgrade: false                 # re-run the installer every play even if present
-# Kimi Code installs into ~/.local/bin/kimi with data at ~/.kimi-code/ (overridable via
-# KIMI_CODE_HOME env var).
-paseo_kimicode_data_dir: "{{ paseo_home_dir }}/.kimi-code"
-paseo_kimicode_bin_dir: "{{ paseo_home_dir }}/.local/bin"
+# Pin e.g. "2.7.3" (the installer honors KIMI_VERSION); empty = latest at first install. Pin for a
+# fleet: unpinned, two hosts provisioned a day apart run different builds.
+paseo_kimicode_version: ""
+paseo_kimicode_upgrade: false                 # re-run the installer every play (honors the pin)
+# The installer's KIMI_INSTALL_DIR. Kimi's DATA dir (config.toml, sessions, OAuth credentials) is a
+# separate knob, KIMI_CODE_HOME. Both default to ~/.kimi-code, so by default the binary lives
+# inside the data dir.
+paseo_kimicode_install_dir: "{{ paseo_home_dir }}/.kimi-code"
+paseo_kimicode_bin_dir: "{{ paseo_kimicode_install_dir }}/bin"
 paseo_kimicode_installed_bin: "{{ paseo_kimicode_bin_dir }}/kimi"
+paseo_kimicode_data_dir: "{{ paseo_home_dir }}/.kimi-code"
 paseo_kimicode_symlink: true                  # also symlink into /usr/local/bin/kimi
 
-# --- credentials --------------------------------------------------------------------------------
-# Merged into the SAME daemon env file as paseo_opencode_secrets + paseo_claude_secrets (one
-# EnvironmentFile — see tasks/service.yml), so the kimi Paseo spawns inherits them. PULL FROM
-# VAULT. MOONSHOT_API_KEY is the documented headless credential. For a gateway instead, set
-# MOONSHOT_BASE_URL + MOONSHOT_AUTH_TOKEN here.
-#   paseo_kimicode_secrets:
-#     MOONSHOT_API_KEY: "{{ vault_moonshot_api_key }}"
+# --- credentials -------------------------------------------------------------------------------
+# READ THIS before reaching for an API-key env var: Kimi Code does NOT read provider credentials
+# from the environment. `KIMI_API_KEY=… kimi` (or MOONSHOT_API_KEY, ANTHROPIC_API_KEY, …) gives no
+# provider its key — Kimi's docs are explicit about it. Three things DO work headless:
+#
+#  1. KIMI_MODEL_* in the daemon env — the only env-only path. KIMI_MODEL_NAME is the switch: with
+#     it set, Kimi synthesizes one in-memory provider from the family. It fits this role's
+#     vault -> /etc/paseo/paseo.env pipeline with no file on the host:
+#       paseo_kimicode_secrets:
+#         KIMI_MODEL_NAME: "kimi-for-coding"                      # the id your endpoint serves
+#         KIMI_MODEL_API_KEY: "{{ vault_kimi_api_key }}"
+#         KIMI_MODEL_BASE_URL: "https://api.kimi.com/coding/v1"   # omitted: https://api.moonshot.ai/v1
+#  2. A config.toml whose provider names an env var: `api_key_env = "MY_KIMI_KEY"`. Kimi re-reads
+#     that variable on every request, so the file stays secret-free: put MY_KIMI_KEY in
+#     paseo_kimicode_secrets and seed the file with paseo_kimicode_config_src below. Use this for
+#     more than one model or provider.
+#  3. OAuth (a Kimi Code subscription): once per host, by hand —
+#       sudo -u paseo env HOME=/var/lib/paseo /var/lib/paseo/.kimi-code/bin/kimi login
+#     It is a device-code flow, so it works over SSH. The token lands in <data_dir>/credentials,
+#     which is per-host STATE this role never touches.
+#
+# Merged into the SAME daemon env file as the other agents' secrets (one EnvironmentFile — see
+# tasks/service.yml). PULL FROM VAULT. Key names must not collide across the per-agent dicts.
 paseo_kimicode_secrets: {}
 
-# Preflight the credential from the TARGET and report the result — but never fail the play. A bad
-# key is otherwise invisible at provision time: Paseo decides a provider is "available" by finding
-# the binary, not by checking auth, so a host with a dead key still provisions green and reports
-# ready, then fails at the first prompt.
-#
-# Deliberately non-fatal. Fleet provisioning shouldn't stop because one credential is stale.
-# Only a definitive HTTP 401 is reported as "rejected"; anything else is "could not verify."
+# Preflight the path-1 credential from the TARGET and report the result — it never fails the play
+# (same contract as paseo_verify_claude_credential). One GET <base>/models with the key as a
+# bearer; only a definitive HTTP 401 is reported as "rejected". It runs only when
+# KIMI_MODEL_API_KEY is present and the provider type is kimi or openai: paths 2 and 3 leave the
+# role nothing it can probe.
 paseo_verify_kimicode_credential: true
 
-# --- config ------------------------------------------------------------------------------------
-# Kimi Code reads its config from ~/.kimi-code/config.json by default. The role deploys a
-# minimal settings file (env vars, regional preferences). Kimi Code generates its own defaults
-# on first run, so this is additive — only deploy if you need to override defaults.
-paseo_kimicode_config_dest: "{{ paseo_kimicode_data_dir }}/config.json"
-# Minimal default settings. An `env` block here can carry credentials, so the file is 0600.
-# Extend via paseo_kimicode_settings_extra.
-paseo_kimicode_settings: {}
-# Deep-merged over the above, so you can add keys without restating them.
-paseo_kimicode_settings_extra: {}
+# --- config.toml (optional) --------------------------------------------------------------------
+# Kimi reads <data_dir>/config.toml — TOML, not JSON — and REWRITES it itself: `kimi login` injects
+# the OAuth provider reference there, and model-list refreshes update the model entries. That
+# makes it closer to state than to config, so by default the role leaves it alone.
+#
+# Set this to a sanitized config.toml on the controller (an absolute path, or a bare filename
+# looked up in the role's files/) to SEED it. Keep it secret-free: `api_key_env`, never `api_key`.
+paseo_kimicode_config_src: ""
+paseo_kimicode_config_dest: "{{ paseo_kimicode_data_dir }}/config.toml"
+# false = write only when the file is absent, so a later `kimi login` or model refresh survives.
+# true  = converge to the controller's copy on every play. Do NOT combine that with OAuth login:
+#         the overwrite drops the provider reference `kimi login` wrote, logging the host out.
+paseo_kimicode_config_overwrite: false
 
 # --- Paseo provider registration ---------------------------------------------------------------
-# Pins the ABSOLUTE binary path with the `acp` subcommand at config.json →
-# agents.providers.kimi.command. Verified against the daemon's own schema: a `command` array
-# takes the override branch of resolveProviderLaunch and is checked with a literal existsSync.
-# `command: ["kimi", "acp"]` launches Kimi Code in ACP mode (JSON-RPC over stdio).
-#
-# NOTE: `kimi` is NOT a builtin Paseo provider. It must be registered as a custom provider
-# with `agents.providers.kimi`. This adds it to the provider list alongside Claude/OpenCode/Codex.
+# Writes config.json -> agents.providers.kimi as a CUSTOM ACP provider. Verified against the
+# daemon's ProviderOverridesSchema and its provider registry:
+#   - `extends: "acp"` is what makes it a provider at all. An entry with only `command` passes
+#     validation and is then silently skipped — Kimi never appears, and nothing logs an error.
+#   - a non-builtin entry with `extends` MUST carry `label`, and `extends: "acp"` MUST carry
+#     `command` (a non-empty array of strings), or the daemon rejects config.json at startup.
+#   - the id must be exactly `kimi`: Paseo keys its Kimi-specific model/thinking handling on it.
+# `command` pins the ABSOLUTE binary path + `acp`, so availability never depends on PATH. Label and
+# description mirror the entry Paseo's own "add provider" catalog writes.
 paseo_register_kimicode_provider: true
+paseo_kimicode_provider_label: "Kimi Code CLI"
+paseo_kimicode_provider_description: "Moonshot AI's open-source terminal coding agent"
+# Environment for the spawned `kimi acp` only (agents.providers.kimi.env) — non-secret switches
+# belong here rather than in the daemon env file. KIMI_CODE_NO_AUTO_UPDATE freezes the installed
+# version: without it Kimi's update preflight can fetch and install a newer build in the
+# background. The role adds KIMI_CODE_HOME from paseo_kimicode_data_dir on top, so the directory
+# Kimi uses and the one this role manages can never disagree.
+paseo_kimicode_provider_env:
+  KIMI_CODE_NO_AUTO_UPDATE: "1"
 
 # =============================================================================
 # Daemon config.json export (grab it back to the controller)

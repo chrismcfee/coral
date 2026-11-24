@@ -20,3 +20,11 @@
     paseo_opencode_config_src: "{{ playbook_dir }}/opencode.jsonc"
   roles:
     - paseo
+    # Neovim / Emacs (optionally Doom) for the same daemon user. Entirely opt-in: with the
+    # defaults this role does nothing, so it is safe to leave listed. Switch it on per host or
+    # group in inventory.yml, e.g. `editors_install_neovim: true`. See editors/README.md.
+    - editors
+    # Language servers, system-wide: pyright + ruff for Python, rust-analyzer + toolchain for
+    # Rust. Also opt-in and also a no-op by default (`lsp_install_python`, `lsp_install_rust`).
+    # One install serves the editors above and the agents the daemon launches. See lsp/README.md.
+    - lsp

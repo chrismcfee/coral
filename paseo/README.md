@@ -13,18 +13,20 @@ can run the same play across the whole fleet without two daemons ever sharing an
 ## What it does
 
 1. Creates a system `paseo` user (home under `/var/lib/paseo` so a hardened unit can write there).
-2. Installs Node (≥20, version-gated) and the Paseo CLI into a per-user npm prefix.
+2. Installs Node (≥22, version-gated) and the Paseo CLI into a per-user npm prefix.
 3. **Downloads + installs the OpenCode CLI** (official installer → `~/.opencode/bin`, version-pinnable)
    for that user, and **deploys your sanitized `opencode.json[c]`** into its config dir.
 4. *(opt-in)* **Installs Claude Code** (Anthropic's native installer, version-pinnable) for that user
    and registers it as a Paseo agent provider. See "Claude Code as a second agent" below.
-5. **Injects your agent provider secrets** (OpenCode's `{env:VAR}` values, `ANTHROPIC_API_KEY`) into
-   the daemon's environment — one file loaded by **both** systemd and OpenRC — so they resolve when
-   Paseo launches the agent CLI.
-6. Seeds + deep-merges `config.json` (listen on the mesh IP, Host-header allowlist, worktrees root),
+5. *(opt-in)* **Installs Kimi Code** (Moonshot's official installer, version-pinnable) and registers
+   it as a custom ACP provider. See "Kimi Code as a third agent" below.
+6. **Injects your agent provider secrets** (OpenCode's `{env:VAR}` values, `ANTHROPIC_API_KEY`, the
+   `KIMI_MODEL_*` family) into the daemon's environment — one file loaded by **both** systemd and
+   OpenRC — so they resolve when Paseo launches the agent CLI.
+7. Seeds + deep-merges `config.json` (listen on the mesh IP, Host-header allowlist, worktrees root),
    preserving the password hash and any keys it doesn't manage.
-7. Sets the daemon password from Vault — idempotently, with rotation support.
-8. Drops a systemd unit **or** OpenRC script (auto-detected) and enables/starts it.
+8. Sets the daemon password from Vault — idempotently, with rotation support.
+9. Drops a systemd unit **or** OpenRC script (auto-detected) and enables/starts it.
 
 ## Quickstart
 
@@ -57,8 +59,10 @@ These diverge from the runbook's literal unit files on purpose:
   the runbook's `Type=simple` + bare `daemon start`, systemd reaps the launcher's exit and — with
   the default `KillMode=control-group` — SIGTERMs the real worker (or, if it escapes the cgroup,
   orphans it unsupervised). That's the same double-detach failure the runbook carefully avoids for
-  OpenRC. The unit here appends `paseo_foreground_flag` so the worker is the main PID, which also
-  delivers the crash-restart you'd otherwise need `supervise-daemon` for.
+  OpenRC. The unit here runs the daemon in the foreground instead, so systemd supervises a process
+  that stays alive. *How* to do that depends on the CLI — `daemon run` from `@getpaseo/cli` 0.9.0,
+  `daemon start --foreground` before it, and the two are mutually exclusive — so the role asks the
+  installed CLI and templates the matching form (see below).
 - **Ordered after NetBird on both init systems.** The runbook's systemd unit only waits on
   `network-online.target`, which doesn't guarantee the WireGuard interface/IP is up — so a bind to
   `100.x` can still `EADDRNOTAVAIL`. This adds `After=`/`Wants=netbird.service` to match the OpenRC
@@ -67,24 +71,51 @@ These diverge from the runbook's literal unit files on purpose:
   processes, so a per-user `opencode` isn't found when Paseo launches it. Both templates export
   `paseo_service_path` (npm prefix + `/usr/local/bin` first).
 
-## Verified against @getpaseo/cli (0.1.101)
+## Verified against @getpaseo/cli (0.17.4)
 
-These were confirmed empirically against the real CLI, not guessed:
+These were confirmed against the real CLI and daemon, not guessed — by reading the published
+package, and by running the role end to end (Fedora 44, systemd) and loading its `config.json` in a
+live daemon:
 
-- **Daemon runs in the foreground with `--foreground`.** `paseo daemon start --foreground` is a real
-  flag; the systemd unit uses it so the worker is the main PID and `Restart=` supervises it.
-- **The password is written, not prompted.** `paseo daemon set-password` is a pure interactive TTY
-  prompt (no `--stdin`/flag) and additionally crashes on Node < 22 — so the role never calls it. It
-  hashes the password with paseo's own `hashDaemonPassword()` (bcryptjs cost 12) on the target and
-  writes it to `config.json` → `daemon.auth.password` (the exact key the daemon's strict schema
-  validates). Rotation-safe via a sha256 marker; nothing is logged.
+- **Foreground mode changed in 0.9.0, and the role detects which form the host has.**
+  `paseo daemon start --foreground` is the flag up to 0.8.x. From 0.9.0 it is a tombstone that exits
+  1 with *"--foreground was removed. Use paseo daemon run"* — a unit still using it crash-loops —
+  and `paseo daemon run` is the foreground mode. Because an unpinned `paseo_cli_version` upgrades the
+  CLI on every play, `tasks/service.yml` asks the installed binary and templates the matching
+  `ExecStart`. The probe matches `daemon run`'s own usage line rather than the exit code: on a CLI
+  without `run`, `daemon run --help` prints the parent help and still exits 0. Override with
+  `paseo_daemon_foreground_command` if you ever need to. Both sides were run for real: a host
+  provisioned with 0.1.101 got `daemon start --foreground`; re-running the play unpinned upgraded
+  it to 0.17.4, rewrote the unit to `daemon run`, and the daemon came back healthy with the same
+  password.
+- **The password is written, not prompted.** `paseo daemon set-password` is still an interactive
+  TTY prompt (it now says so itself: *"needs a terminal to read the password"*) — so the role never
+  calls it. It hashes the password with paseo's own `hashDaemonPassword()` (bcryptjs cost 12) on the
+  target and writes it to `config.json` → `daemon.auth.password` (the exact key the daemon's strict
+  schema validates). A live 0.17.4 daemon accepted the right password and rejected a wrong one.
+  Rotation-safe via a sha256 marker; nothing is logged.
+- **The daemon's environment is not just a pass-through.** The daemon reads its own settings from
+  the environment (`PASEO_PASSWORD`, `PASEO_LISTEN`, `PASEO_HOSTNAMES`, `PORT`, …). In foreground
+  mode — systemd — they **override `config.json`**; from 0.9.0 `daemon start` — OpenRC — **strips**
+  them before launching anything. So never use those names for agent secrets: `PASEO_PASSWORD` in
+  the env file silently replaces the password this role manages on one init system and vanishes on
+  the other. Use a neutral name such as `PASEO_TOKEN`. The role warns if it sees one.
+- **Custom providers need `extends`.** An `agents.providers.<id>` entry for a non-builtin id is only
+  a provider when it has `extends`; with just `command` it validates and is then silently skipped.
+  `extends` in turn requires `label`, and `extends: "acp"` requires `command`. See the Kimi section.
 - **Node ≥ 22 is required** (`paseo_min_node_major: 22`). The CLI's prompts use `util.styleText`'s
   array form, which only exists on Node 22+. Fedora and Arch ship Node ≥22 (distro packages are fine);
   on Debian/Ubuntu the distro Node is too old — install from NodeSource (or set
   `paseo_manage_node: false` and provide your own ≥22).
 - **Config keys are confirmed:** `daemon.listen` (string), `daemon.hostnames` (array or `true`),
-  `worktrees.root`, `daemon.auth.password`. The schema is **strict** — the role writes only known
-  keys, so don't hand-add others to `config.json` or the daemon will refuse to start.
+  `daemon.relay.enabled`, `worktrees.root`, `daemon.auth.password`, `agents.providers.<id>`. The
+  schema is **strict** at the root and under `daemon` — the role writes only known keys, so don't
+  hand-add others to `config.json` or the daemon will refuse to start.
+- **Every writer of `config.json` emits the same bytes.** Four task files merge into that file. If
+  two of them disagree on so much as a trailing newline, each play flips the file twice and every
+  flip restarts the daemon — which is what used to happen on any host with Claude Code enabled.
+- **`PASEO_HOME` is `0700`.** The daemon re-tightens it to owner-only at startup; a looser mode in
+  the role would be undone and reported as a change on every play.
 
 ## Out of scope (manage separately)
 
@@ -106,11 +137,12 @@ These were confirmed empirically against the real CLI, not guessed:
 | `paseo_min_node_major` | `22` | Confirmed required — the CLI's prompts need Node ≥22. |
 | `paseo_set_password` | `true` | `false` = rely on the mesh as the sole boundary (no password). |
 | `paseo_daemon_password` | `""` | Required when above is true — pull from Vault. |
-| `paseo_foreground_flag` | `--foreground` | Verify on your build. Empty string disables it. |
+| `paseo_daemon_foreground_command` | `""` | Empty = ask the installed CLI (`daemon run` on ≥ 0.9.0, else `daemon start --foreground`). Set to force one. |
+| `paseo_foreground_flag` | `--foreground` | Legacy only: appended to `daemon start` on a CLI older than 0.9.0. |
 | `paseo_init_system` | auto | `systemd` or `openrc` from `ansible_service_mgr`. |
 | `paseo_after_netbird` / `paseo_netbird_unit` | `true` / `netbird` | Ordering dependency. |
 | `paseo_manage_node` | `true` | `false` if you provide Node yourself (version still gated). |
-| `paseo_cli_version` | `""` | Pin the CLI; empty tracks latest. |
+| `paseo_cli_version` | `""` | Empty tracks latest — the CLI is upgraded on **every play**. Pin (e.g. `0.17.4`) for a reproducible fleet. |
 | `paseo_opencode_bin` | `""` | If set, symlinks a pre-existing opencode binary into `/usr/local/bin`. |
 | `paseo_install_opencode` | `true` | Download+install OpenCode (official installer) for `paseo_user`. |
 | `paseo_opencode_version` | `""` | Pin OpenCode (e.g. `1.17.9`); empty = latest at first install. |
@@ -123,6 +155,11 @@ These were confirmed empirically against the real CLI, not guessed:
 | `paseo_claude_secrets` | `{}` | `ANTHROPIC_API_KEY` etc. (Vault); merged into the same daemon env file. |
 | `paseo_verify_claude_credential` | `true` | Preflight the key and *report* the result. Never fails the play. |
 | `paseo_claude_settings` | `{env: {DISABLE_AUTOUPDATER: "1"}}` | Role-owned `~/.claude/settings.json`. Extend via `paseo_claude_settings_extra`. |
+| `paseo_install_kimicode` | `false` | Install Kimi Code (official installer) for `paseo_user` and register it with Paseo. |
+| `paseo_kimicode_version` | `""` | Pin (e.g. `2.7.3`); empty = latest at first install. **Pin for a fleet.** |
+| `paseo_kimicode_secrets` | `{}` | The `KIMI_MODEL_*` family, or the env var a `config.toml` provider names (Vault). Same env file. |
+| `paseo_kimicode_config_src` | `""` | Optional sanitized `config.toml` to seed. Empty = Kimi manages its own. |
+| `paseo_verify_kimicode_credential` | `true` | Preflight the `KIMI_MODEL_*` key and *report*. Never fails the play. |
 | `paseo_systemd_protect_home` | `true` | See own-user mode below. |
 | `paseo_home_dir` / `paseo_state_dir` | `/var/lib/paseo` / `…/.paseo` | Distinct `state_dir` per daemon for multiple-on-one-host. |
 
@@ -215,8 +252,9 @@ you can do, independently or together:
   clobber. (Creds under `~/.local/share/opencode/` are deliberately **not** fetched; use the script's
   `--data` flag by hand if you need that dir.)
 - **Wire Direction B**: `paseo_manage_opencode_mcp: true` deep-merges only the `mcp.paseo` block
-  (`oauth:false` + `{env:PASEO_PASSWORD}`) into the resolved file, creating it if absent and leaving
-  everything else untouched.
+  (`oauth:false` + a `Bearer {env:PASEO_TOKEN}` header) into the resolved file, creating it if absent
+  and leaving everything else untouched. The env var is `paseo_opencode_mcp_token_env`; it used to be
+  hardcoded to `PASEO_PASSWORD`, which the daemon claims for itself (see "Verified" above).
 - **Print the effective config**: `paseo_print_opencode_config: true` reproduces opencode's
   global + project + `$OPENCODE_CONFIG` merge from the files (jsonc-aware) and prints the resolved
   *values* to the play output. Secrets are redacted unless `paseo_print_opencode_config_raw: true`.
@@ -248,7 +286,7 @@ Off by default (it pulls a ~260 MB binary per host). Turn it on with:
 
 ```yaml
 paseo_install_claude: true
-paseo_claude_version: "2.1.212"        # pin exactly; `stable`/`latest` drift between hosts
+paseo_claude_version: "2.1.325"        # pin exactly; `stable`/`latest` drift between hosts
 paseo_claude_secrets:                   # from Vault
   ANTHROPIC_API_KEY: "{{ vault_anthropic_api_key }}"
 ```
@@ -263,6 +301,12 @@ Idempotency reads the launcher **symlink** (`readlink -e`), so a no-op play neve
 cold start. On a host that already has `claude`, the role calls `claude install <version>` rather
 than re-running the bootstrap — the bootstrap always downloads `latest` first *and then* the pin, so
 it costs two full downloads.
+
+**Moving a fleet to a newer Claude Code.** A channel (`stable` / `latest`) is only resolved at
+*first* install: an installed version number can't be compared with the word "stable", so a host
+that already has Claude Code is left alone, and `DISABLE_AUTOUPDATER` stops it updating itself.
+Either bump an exact pin — the role then re-pins every host that differs — or run once with
+`-e paseo_claude_upgrade=true`.
 
 ### How Paseo finds it
 
@@ -323,6 +367,133 @@ testing: `uri` aborts before sending anything if the target has a too-permissive
 would silently downgrade every check to "could not verify"), and reading the header from stdin keeps
 the credential out of `argv`, so it never appears in the process table on a shared host.
 
+## Kimi Code as a third agent
+
+[Kimi Code](https://moonshotai.github.io/kimi-code/) is **not** a Paseo builtin. Paseo drives it over
+ACP (`kimi acp`, JSON-RPC on stdio), and only once `config.json` declares a custom provider for it.
+Off by default (a ~62 MB download, ~190 MB on disk). Turn it on with:
+
+```yaml
+paseo_install_kimicode: true
+paseo_kimicode_version: "2.7.3"         # pin exactly; unpinned hosts drift apart
+```
+
+Install is Moonshot's **official installer** (`code.kimi.com/kimi-code/install.sh`): one glibc binary
+at `~/.kimi-code/bin/kimi`, sha256-verified against the release manifest, no Node at runtime. Needs
+`bash`, `curl`, `sha256sum` and outbound HTTPS; musl is unsupported. The role passes
+`KIMI_NO_MODIFY_PATH`, because left alone the installer **edits the user's shell rc** and renames any
+older `kimi` it finds on `PATH`.
+
+The download host also sets the region Kimi assumes until first login: `code.kimi.com` →
+`mainland-cn`, `code.kimi.ai` → `global`. It only matters for the OAuth login. For the global
+channel set `paseo_kimicode_install_url: "https://code.kimi.ai/kimi-code/install.sh"`.
+
+### Credentials — the part that is easy to get wrong
+
+**Kimi Code does not read provider credentials from the environment.** `KIMI_API_KEY=… kimi`,
+`MOONSHOT_API_KEY`, `ANTHROPIC_API_KEY` — none of them reach a provider; Kimi's own docs say so
+explicitly. Putting one in the daemon env file does nothing, silently. Three things do work on a
+headless host:
+
+1. **The `KIMI_MODEL_*` family** — the only env-only path. `KIMI_MODEL_NAME` is the switch; with it
+   set, Kimi builds one in-memory provider from the rest. No file on the host, and it fits the
+   vault → `/etc/paseo/paseo.env` pipeline as is:
+
+   ```yaml
+   paseo_kimicode_secrets:                 # from Vault
+     KIMI_MODEL_NAME: "kimi-for-coding"    # the model id your endpoint serves
+     KIMI_MODEL_API_KEY: "{{ vault_kimi_api_key }}"
+     KIMI_MODEL_BASE_URL: "https://api.kimi.com/coding/v1"   # omitted: https://api.moonshot.ai/v1
+   ```
+
+2. **A `config.toml` provider with `api_key_env`.** Kimi re-reads the named variable on every
+   request, so the file itself stays secret-free — the same split as `opencode.jsonc`. Use this for
+   more than one model or provider:
+
+   ```toml
+   # kimi-config.toml, on the controller
+   default_model = "kimi"
+   [providers.kimi]
+   type = "kimi"
+   base_url = "https://api.kimi.com/coding/v1"
+   api_key_env = "MY_KIMI_KEY"
+   [models.kimi]
+   provider = "kimi"
+   model = "kimi-for-coding"
+   max_context_size = 262144
+   ```
+   ```yaml
+   paseo_kimicode_config_src: "{{ playbook_dir }}/kimi-config.toml"
+   paseo_kimicode_secrets: { MY_KIMI_KEY: "{{ vault_kimi_api_key }}" }
+   ```
+
+3. **OAuth** (a Kimi Code subscription) — once per host, by hand. It is a device-code flow, so it
+   works over SSH:
+
+   ```sh
+   sudo -u paseo env HOME=/var/lib/paseo /var/lib/paseo/.kimi-code/bin/kimi login
+   ```
+
+   The token lands in `~/.kimi-code/credentials`. That is per-host **state**, in the same category
+   as `daemon-keypair.json`: the role never reads, writes or copies it.
+
+### `config.toml` is closer to state than config
+
+Kimi rewrites `~/.kimi-code/config.toml` itself: `kimi login` injects the OAuth provider reference
+there, and model refreshes update the model entries. So the role leaves it alone by default, and
+`paseo_kimicode_config_src` only **seeds** it — written when absent, never again.
+`paseo_kimicode_config_overwrite: true` converges it on every play instead; don't combine that with
+OAuth, since each overwrite drops the reference `kimi login` wrote and logs the host out.
+
+### How Paseo finds it
+
+The role writes this to `config.json` — the same shape Paseo's own "add provider" catalog produces,
+with the binary path made absolute:
+
+```json
+"agents": { "providers": { "kimi": {
+  "extends": "acp",
+  "label": "Kimi Code CLI",
+  "description": "Moonshot AI's open-source terminal coding agent",
+  "command": ["/var/lib/paseo/.kimi-code/bin/kimi", "acp"],
+  "env": { "KIMI_CODE_NO_AUTO_UPDATE": "1", "KIMI_CODE_HOME": "/var/lib/paseo/.kimi-code" }
+} } }
+```
+
+Every key is load-bearing, verified against the daemon's schema and registry and confirmed on a
+running 0.17.4 daemon:
+
+- **`extends: "acp"`** is what makes it a provider. With only `command`, the entry passes validation
+  and is then skipped without a word — Kimi never appears. (An earlier version of this role did
+  exactly that.)
+- **`label`** is required once `extends` is present; without it the daemon rejects `config.json` and
+  will not start.
+- **`command`** is absolute, so availability never depends on `PATH`.
+- **`env`** reaches only the spawned `kimi acp`. `KIMI_CODE_NO_AUTO_UPDATE` freezes the pinned
+  version — otherwise Kimi's update preflight can install a newer build in the background.
+- The provider id must be exactly **`kimi`**: Paseo selects its Kimi-specific ACP client by that id.
+
+As with Claude Code, **auth is not part of availability**: a host with no working credential still
+reports Kimi as *ready* and fails at the first prompt.
+
+### A bad credential never fails the play
+
+`paseo_verify_kimicode_credential` (default on) sends one `GET <base>/models` with the
+`KIMI_MODEL_API_KEY` as a bearer and **reports** the result — `200` works, `401` is a loud warning,
+anything else is "could not verify". It never fails the play, and it only runs for path 1 with a
+`kimi`/`openai` provider type: paths 2 and 3 leave the role nothing it can probe, and it says so
+rather than guessing.
+
+### Check it
+
+```sh
+ansible-playbook -i inventory.yml test-kimicode.yml --limit <host>
+ansible-playbook -i inventory.yml test-kimicode-verify.yml --limit <host>
+```
+
+The verify play asks the **running daemon** which providers it reports — the one check that catches
+a registration the schema accepts but the registry ignores.
+
 ## Daemon config
 
 Grab each host's `config.json` back to the controller with `paseo_fetch_daemon_config: true`.
@@ -345,11 +516,17 @@ still works even though the exact key Paseo stores the hash under is build-depen
 - On the first run, `set-password` writes `config.json` in its own format; the config merge then
   normalises it to canonical JSON (preserving the hash) in the same run. Subsequent runs are stable.
 - Changing `hostnames`/`listen` later re-merges cleanly without clobbering the password.
+- **Dry runs.** `--check` works on a host that has been provisioned at least once — the read-only
+  probes (Node version, the CLI's foreground sub-command, the Kimi version) run for real, so the
+  preview is truthful — and is the sensible first step before upgrading a fleet. On a brand-new host
+  it stops at the first task that must run as the not-yet-created `paseo` user; that is inherent to
+  a dry run, not a fault.
 
 ## Notes from the runbook worth keeping in mind
 
 - `schedule create --host` requires `--cwd`; remote `paseo run`/`schedule` don't inherit a shell's
   working dir. Bake `--cwd` into any automation you build on top.
-- The OpenRC delegation wrapper gives up auto-restart-on-crash (documented tradeoff). For crash
-  supervision on OpenRC, point `supervise-daemon` at Paseo's foreground mode with `/api/health` as
-  the liveness probe.
+- On OpenRC, `daemon start` launches Paseo's own supervisor, which restarts a crashed worker by
+  itself. What the delegation wrapper does not give you is a restart of that supervisor if *it*
+  dies. For that, point `supervise-daemon` at Paseo's foreground mode (`daemon run` on
+  `@getpaseo/cli` ≥ 0.9.0) with `/api/health` as the liveness probe.

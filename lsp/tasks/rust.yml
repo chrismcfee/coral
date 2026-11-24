@@ -1,0 +1,76 @@
+---
+# Rust: rust-analyzer AND what it cannot work without — cargo, rustc and the standard library's
+# source — always from one origin, so the server matches the compiler it drives.
+#
+#   lsp_rust_toolchain == ""   the distro's packages          (rust_distro.yml)
+#   lsp_rust_toolchain != ""   the official toolchain, pinned (rust_rustup.yml)
+
+- name: See what Rust tooling is already there
+  ansible.builtin.include_tasks: rust_probe.yml
+
+# Skipped only when a COMPLETE setup already works — server, toolchain and std source. A partial
+# one (rust and cargo installed, no rust-analyzer: the common case) is completed, not skipped.
+- name: Install Rust + rust-analyzer from the distro
+  ansible.builtin.include_tasks: rust_distro.yml
+  when:
+    - lsp_rust_toolchain | length == 0
+    - not ((lsp_skip_if_present | bool)
+           and (_lsp_rust_state.analyzer | bool)
+           and (_lsp_rust_state.cargo | bool)
+           and (_lsp_rust_state.src | bool))
+
+- name: Install the official Rust toolchain
+  ansible.builtin.include_tasks: rust_rustup.yml
+  when: lsp_rust_toolchain | length > 0
+
+- name: Check the result
+  ansible.builtin.include_tasks: rust_probe.yml
+
+# Each gate stands down for ONE case: a dry run on a host where the piece is still missing (the
+# installs above are no-ops under --check, so failing would only restate that).
+- name: Require a working rust-analyzer
+  ansible.builtin.assert:
+    that: _lsp_rust_state.analyzer | bool
+    fail_msg: >-
+      rust-analyzer does not run (PATH {{ lsp_system_path }}) —
+      {{ _lsp_ra_ver.stderr | default('', true) | trim
+         | default(_lsp_ra_ver.msg | default('not found'), true) }}
+      {{ _lsp_shim_hint if ('Unknown binary' in (_lsp_ra_ver.stderr | default(''))) else '' }}
+    quiet: true
+  vars:
+    _lsp_shim_hint: >-
+      That is a rustup shim with no component behind it, and it is ahead of any working copy on
+      PATH. Run `rustup component add rust-analyzer` for that toolchain, take the shim off PATH,
+      or set lsp_rust_toolchain so this role links a working one into {{ lsp_bin_dir }}.
+  when: not (ansible_check_mode and not (_lsp_rust_state.analyzer | bool))
+
+- name: Require cargo and rustc
+  ansible.builtin.assert:
+    that: _lsp_rust_state.cargo | bool
+    fail_msg: >-
+      rust-analyzer is there but cargo / rustc are not on {{ lsp_system_path }}. It shells out to
+      both, so without them it loads no project. Install the toolchain, or set
+      lsp_rust_toolchain so this role does.
+    quiet: true
+  when: not (ansible_check_mode and not (_lsp_rust_state.cargo | bool))
+
+- name: Require the standard library source (rust-src)
+  ansible.builtin.assert:
+    that: _lsp_rust_state.src | bool
+    fail_msg: >-
+      The Rust standard library source is missing from
+      {{ _lsp_rust_sysroot.stdout | default('the sysroot', true) | trim }}/lib/rustlib/src.
+      Without it rust-analyzer has no completion, hover or go-to-definition for anything in std.
+      Install your distro's rust-src package (a USE flag on Gentoo), or set lsp_skip_if_present:
+      false so this role adds it.
+    quiet: true
+  when: not (ansible_check_mode and not (_lsp_rust_state.src | bool))
+
+- name: Verify rust-analyzer
+  ansible.builtin.include_tasks: verify.yml
+  vars:
+    _lsp_verify_label: rust-analyzer
+    _lsp_verify_command: [rust-analyzer]
+  when:
+    - lsp_verify | bool
+    - not ansible_check_mode

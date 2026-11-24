@@ -1,0 +1,40 @@
+---
+# Install the list `_editors_pkgs` with the host's own package manager. Included (not imported) so
+# each caller passes its own list; `_editors_pkg_label` only makes the task names readable.
+#
+# One task per family, matching the paseo role: the generic `package` module can't drive portage,
+# and Debian needs a cache refresh the others don't.
+
+- name: "Install {{ _editors_pkg_label }} (Gentoo)"
+  community.general.portage:
+    package: "{{ _editors_pkgs }}"
+    state: present
+  when:
+    - ansible_facts['os_family'] == 'Gentoo'
+    - _editors_pkgs | length > 0
+
+- name: "Install {{ _editors_pkg_label }} (Debian/Ubuntu)"
+  ansible.builtin.apt:
+    name: "{{ _editors_pkgs }}"
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+  when:
+    - ansible_facts['os_family'] == 'Debian'
+    - _editors_pkgs | length > 0
+
+- name: "Install {{ _editors_pkg_label }} (Fedora/RHEL)"
+  ansible.builtin.package:
+    name: "{{ _editors_pkgs }}"
+    state: present
+  when:
+    - ansible_facts['os_family'] == 'RedHat'
+    - _editors_pkgs | length > 0
+
+- name: "Install {{ _editors_pkg_label }} (Arch)"
+  community.general.pacman:
+    name: "{{ _editors_pkgs }}"
+    state: present
+  when:
+    - ansible_facts['os_family'] == 'Archlinux'
+    - _editors_pkgs | length > 0

@@ -189,7 +189,7 @@
                  'url': paseo_opencode_mcp_url,
                  'enabled': true,
                  'oauth': false,
-                 'headers': {'Authorization': 'Bearer {env:PASEO_PASSWORD}'}
+                 'headers': {'Authorization': 'Bearer {env:' ~ paseo_opencode_mcp_token_env ~ '}'}
                }}}, recursive=True)
              | to_nice_json }}
         dest: "{{ paseo_opencode_config_path }}"

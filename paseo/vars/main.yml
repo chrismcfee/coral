@@ -1,5 +1,30 @@
 ---
 # Internal — not meant to be overridden per host.
+
+# Environment names the Paseo DAEMON treats as its own settings (a security-relevant subset of
+# DAEMON_SETTING_ENV_KEYS in @getpaseo/server 0.17.4: the ones that move the bind address, the
+# Host/CORS allowlists, the password, or the relay). tasks/service.yml warns when an agent-secrets
+# dict uses one, because the daemon — not the agent — would act on it. PASEO_TOKEN is deliberately
+# absent: it means nothing to the daemon, which is what makes it safe as an agent-side bearer.
+paseo_daemon_setting_env_keys:
+  - PASEO_ALLOWED_HOSTS
+  - PASEO_APP_BASE_URL
+  - PASEO_CORS_ORIGINS
+  - PASEO_HOSTNAMES
+  - PASEO_LISTEN
+  - PASEO_PASSWORD
+  - PASEO_RELAY_ENABLED
+  - PASEO_RELAY_ENDPOINT
+  - PASEO_RELAY_PUBLIC_ENDPOINT
+  - PASEO_RELAY_PUBLIC_USE_TLS
+  - PASEO_RELAY_USE_TLS
+  - PASEO_SERVICE_PROXY_ENABLED
+  - PASEO_SERVICE_PROXY_LISTEN
+  - PASEO_SERVICE_PROXY_PUBLIC_BASE_URL
+  - PASEO_TRUSTED_PROXIES
+  - PASEO_WEB_UI_ENABLED
+  - PORT
+
 paseo_node_packages:
   Gentoo: net-libs/nodejs
   Debian:

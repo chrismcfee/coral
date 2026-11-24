@@ -1,0 +1,41 @@
+---
+# Prove one language server works, by speaking LSP to it. Included once per server with:
+#   _lsp_verify_label    what to call it in task names and messages
+#   _lsp_verify_command  the command a client would start, as a list
+#
+# files/lsp-probe.py starts the server AS lsp_verify_user (the task itself is root) in an empty
+# scratch workspace and completes `initialize`. That one exchange catches what a PATH check
+# cannot: a rustup shim with no component behind it, pyright without Node, a binary built for a
+# newer glibc, a tree only root can read.
+
+- name: "Handshake with {{ _lsp_verify_label }}"
+  ansible.builtin.script:
+    cmd: >-
+      lsp-probe.py
+      {{ ('--user ' ~ (lsp_verify_user | quote)) if (lsp_verify_user | length > 0) else '' }}
+      --timeout {{ lsp_verify_timeout | int }}
+      -- {{ _lsp_verify_command | map('quote') | join(' ') }}
+    executable: "{{ ansible_facts['python']['executable'] | default('python3', true) }}"
+  environment:
+    PATH: "{{ lsp_system_path }}"
+  register: _lsp_handshake
+  changed_when: false
+  failed_when: false
+
+# The probe prints one JSON object; the search keeps a stray warning line from breaking from_json.
+# ([{] rather than \{: backslashes in Jinja string literals are not portable — ansible-core 2.19+
+# reads them one way in a bare {{ expression }} and another once the template has a {% statement %}.)
+- name: "Require a completed handshake from {{ _lsp_verify_label }}"
+  ansible.builtin.assert:
+    that: _lsp_handshake.rc == 0
+    fail_msg: >-
+      {{ _lsp_verify_label }} is installed but did not complete an LSP handshake
+      {{ ('as user ' ~ lsp_verify_user) if (lsp_verify_user | length > 0) else '' }}
+      ({{ _lsp_verify_command | join(' ') }}):
+      {{ _lsp_report.error | default(_lsp_handshake.stderr | default('no output'), true) }}
+      {{ (' | server said: ' ~ (_lsp_report.stderr | join(' / '))) if (_lsp_report.stderr | default([]) | length > 0) else '' }}
+      Set lsp_verify: false to skip this check.
+    quiet: true
+  vars:
+    _lsp_report: >-
+      {{ _lsp_handshake.stdout | default('') | regex_search('(?s)[{].*[}]') | default('{}', true) | from_json }}

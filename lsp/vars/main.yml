@@ -1,0 +1,50 @@
+---
+# Internal — package names per OS family (ansible_facts['os_family']). Override the *public*
+# knobs in defaults/ instead (lsp_rust_packages / lsp_ruff_packages / lsp_node_packages take a
+# plain list and replace the entry for the host's own family).
+
+# PATH every probe runs with: what a login shell — and the paseo daemon — would search, without
+# whatever happens to be exported in the Ansible session.
+lsp_system_path: >-
+  {{ ([lsp_bin_dir, '/usr/local/sbin', '/usr/local/bin', '/usr/sbin', '/usr/bin', '/sbin', '/bin']
+      | unique) | join(':') }}
+
+# Toolchain + standard-library source + the server, plus rustfmt (rust-analyzer formats with it)
+# and clippy. Gentoo is absent on purpose: there these are USE flags, handled in rust_distro.yml.
+lsp_rust_packages_by_family:
+  Debian: [rustc, cargo, rust-src, rust-analyzer, rustfmt, rust-clippy]   # Debian 13+; not 12, not Ubuntu
+  RedHat: [rust, cargo, rust-src, rust-analyzer, rustfmt, clippy]
+  Archlinux: [rust, rust-src, rust-analyzer]      # `rust` already carries cargo, rustfmt, clippy
+
+lsp_rust_gentoo_use: [rust-analyzer, rust-src, clippy, rustfmt]
+
+lsp_ruff_packages_by_family:
+  Gentoo: [dev-util/ruff]            # the stable keyword trails upstream; pin lsp_ruff_version for current
+  RedHat: [ruff]                     # Fedora; EPEL on RHEL-likes
+  Archlinux: [ruff]
+  # Debian/Ubuntu: no package — pin lsp_ruff_version to use the official binary.
+
+lsp_node_packages_by_family:
+  Gentoo: [net-libs/nodejs]          # npm comes with it (USE=npm, on by default)
+  Debian: [nodejs, npm]
+  RedHat: [nodejs, nodejs-npm]
+  Archlinux: [nodejs, npm]
+
+# What each official download needs on the host.
+lsp_download_tools_by_family:
+  Gentoo: []                         # tar, gzip and ca-certificates are in @system
+  Debian: [tar, gzip, ca-certificates]
+  RedHat: [tar, gzip]
+  Archlinux: [tar, gzip]
+
+# uname -m -> the architecture part of a Rust-style target triple (what both rustup and ruff name
+# their Linux builds after). Anything else: set lsp_rust_target / lsp_ruff_target yourself.
+lsp_arch_map:
+  x86_64: x86_64
+  amd64: x86_64
+  aarch64: aarch64
+  arm64: aarch64
+
+# The two npm packages that ship `pyright-langserver`. They cannot share a prefix (same command
+# names), so installing one removes the other.
+lsp_pyright_flavours: [pyright, basedpyright]

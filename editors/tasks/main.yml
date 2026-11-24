@@ -1,0 +1,61 @@
+---
+# Editors for a dev host: Neovim and/or Emacs, optionally with a deployed config (and Doom).
+# Everything is opt-in — with the defaults this role does nothing at all, so it is safe to list
+# in a fleet play and switch on per host or group.
+
+- name: Work out whether any per-user setup was requested
+  ansible.builtin.set_fact:
+    _editors_needs_user: >-
+      {{ ((editors_install_neovim | bool)
+          and ((editors_neovim_config_src | length > 0) or (editors_neovim_config_repo | length > 0)))
+         or ((editors_install_emacs | bool) and (editors_emacs_doom | bool)) }}
+
+- name: Validate inputs
+  ansible.builtin.assert:
+    that:
+      - not ((editors_neovim_config_src | length > 0) and (editors_neovim_config_repo | length > 0))
+      - not ((editors_doom_config_src | length > 0) and (editors_doom_config_repo | length > 0))
+      - (not (_editors_needs_user | bool))
+        or ((editors_user | length > 0) and (editors_home | length > 0))
+    fail_msg: >-
+      Check vars: a config takes ONE source — set editors_*_config_src (a directory on the
+      controller) or editors_*_config_repo (a git URL), not both. And deploying a config or Doom
+      needs editors_user and editors_home: they default to the paseo role's daemon user, so set
+      them explicitly when that role isn't in this play.
+    quiet: true
+
+# A clear failure now beats a confusing `sudo: unknown user` three tasks later.
+- name: Confirm the target user exists
+  ansible.builtin.getent:
+    database: passwd
+    key: "{{ editors_user }}"
+  when:
+    - _editors_needs_user | bool
+    - not ansible_check_mode
+
+- name: Install shared tooling (git, ripgrep, fd)
+  ansible.builtin.include_tasks: packages.yml
+  vars:
+    _editors_pkg_label: editor support tools
+    _editors_pkgs: >-
+      {{ editors_support_packages
+         if (editors_support_packages | length > 0)
+         else (editors_support_packages_by_family[ansible_facts['os_family']] | default([])) }}
+  when:
+    - editors_install_support_tools | bool
+    - (editors_install_neovim | bool) or (editors_install_emacs | bool)
+
+- name: Install extra packages
+  ansible.builtin.include_tasks: packages.yml
+  vars:
+    _editors_pkg_label: extra packages
+    _editors_pkgs: "{{ editors_extra_packages }}"
+  when: editors_extra_packages | length > 0
+
+- name: Set up Neovim
+  ansible.builtin.import_tasks: neovim.yml
+  when: editors_install_neovim | bool
+
+- name: Set up Emacs
+  ansible.builtin.import_tasks: emacs.yml
+  when: editors_install_emacs | bool

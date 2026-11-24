@@ -33,6 +33,12 @@ auth.json
 .credentials.json
 .claude.json
 
+# --- Raw Kimi Code state that must never be copied into the repo ---
+# ~/.kimi-code holds OAuth tokens (credentials/), sessions and a config.toml that `kimi login`
+# rewrites. None of it is a provisioning input: the role seeds a SANITIZED config.toml you name
+# explicitly (paseo_kimicode_config_src) and feeds keys from the vault.
+/.kimi-code/
+
 # --- Artifacts fetched back from hosts (configs / redacted hashes) ---
 /fetched-opencode/
 /fetched-daemon-config/

@@ -5,7 +5,8 @@ galaxy_info:
   author: homelab
   description: >-
     Deploy and supervise a headless Paseo daemon over a NetBird mesh, one daemon per host,
-    with OpenCode wiring. Templates config (never state), leaves keypair generation to each box.
+    with OpenCode, Claude Code and Kimi Code wiring. Templates config (never state), leaves
+    keypair generation to each box.
   license: MIT
   min_ansible_version: "2.14"
   platforms:
@@ -26,6 +27,8 @@ galaxy_info:
   galaxy_tags:
     - paseo
     - opencode
+    - claude
+    - kimi
     - netbird
     - openrc
     - systemd

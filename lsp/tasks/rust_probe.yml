@@ -1,0 +1,52 @@
+---
+# Read-only: what Rust tooling does this host have, as the system PATH sees it? Included before
+# the install (to decide whether there is anything to do) and again after it (to assert on).
+# Sets _lsp_rust_state.{analyzer,cargo,src}.
+#
+# "On PATH" is deliberately not the test. `rust-analyzer --version` has to succeed: rustup's
+# shim is always on PATH and fails with "Unknown binary 'rust-analyzer' in official toolchain"
+# when the component behind it was never installed.
+
+- name: Query rust-analyzer
+  ansible.builtin.command: rust-analyzer --version
+  environment:
+    PATH: "{{ lsp_system_path }}"
+  register: _lsp_ra_ver
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: Query cargo
+  ansible.builtin.command: cargo --version
+  environment:
+    PATH: "{{ lsp_system_path }}"
+  register: _lsp_cargo_ver
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: Query the Rust sysroot
+  ansible.builtin.command: rustc --print sysroot
+  environment:
+    PATH: "{{ lsp_system_path }}"
+  register: _lsp_rust_sysroot
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+# rust-src unpacks to <sysroot>/lib/rustlib/src/rust/library; that is where rust-analyzer looks.
+- name: Look for the standard library source (rust-src)
+  ansible.builtin.stat:
+    path: "{{ _lsp_rust_sysroot.stdout | default('') | trim }}/lib/rustlib/src/rust/library/std/src/lib.rs"
+    follow: true
+  register: _lsp_rust_src
+  when:
+    - _lsp_rust_sysroot.rc == 0
+    - _lsp_rust_sysroot.stdout | default('') | trim | length > 0
+
+- name: Record the Rust tooling state
+  ansible.builtin.set_fact:
+    _lsp_rust_state:
+      analyzer: "{{ _lsp_ra_ver.rc == 0 }}"
+      cargo: "{{ _lsp_cargo_ver.rc == 0 and _lsp_rust_sysroot.rc == 0 }}"
+      src: "{{ _lsp_rust_src.stat.exists | default(false) }}"

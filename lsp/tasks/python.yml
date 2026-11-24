@@ -1,0 +1,325 @@
+---
+# Python language servers: pyright (npm, in a prefix of its own) and ruff (the distro package or
+# the official release binary). Each ends with a real LSP handshake (verify.yml).
+
+# ================================================================================================
+# pyright
+# ================================================================================================
+- name: Set up pyright
+  when: "'pyright' in lsp_python_servers"
+  block:
+    # Resolved to its real path so we can tell OUR install (under lsp_npm_prefix) from someone
+    # else's: Arch's pyright package, a hand install.
+    - name: Look for a pyright-langserver already on PATH
+      ansible.builtin.shell: 'p=$(command -v pyright-langserver) && readlink -f "$p"'
+      environment:
+        PATH: "{{ lsp_system_path }}"
+      register: _lsp_pyright_which
+      changed_when: false
+      failed_when: false
+      check_mode: false
+
+    # Someone else's pyright is left alone — unless a version is pinned: a pin is a request for
+    # exactly that version, and lsp_bin_dir precedes /usr/bin so ours then wins.
+    - name: Decide whether pyright is this role's to install
+      ansible.builtin.set_fact:
+        _lsp_pyright_manage: >-
+          {{ not ((lsp_skip_if_present | bool)
+                  and (lsp_pyright_version | length == 0)
+                  and (_lsp_pyright_which.rc == 0)
+                  and not ((_lsp_pyright_which.stdout | trim) is match((lsp_npm_prefix | regex_escape) ~ '/'))) }}
+
+    - name: Install pyright with npm
+      when: _lsp_pyright_manage | bool
+      block:
+        - name: Look for npm
+          ansible.builtin.shell: command -v npm
+          environment:
+            PATH: "{{ lsp_system_path }}"
+          register: _lsp_npm_which
+          changed_when: false
+          failed_when: false
+          check_mode: false
+
+        # Only when npm is missing: a host whose Node came from NodeSource or nvm must not gain
+        # a second, older one from the distro.
+        - name: Install Node.js + npm from the distro
+          ansible.builtin.include_tasks: packages.yml
+          vars:
+            _lsp_pkg_label: Node.js + npm
+            _lsp_pkgs: >-
+              {{ lsp_node_packages
+                 if (lsp_node_packages | length > 0)
+                 else (lsp_node_packages_by_family[ansible_facts['os_family']] | default([])) }}
+          when:
+            - lsp_manage_node | bool
+            - _lsp_npm_which.rc != 0
+
+        # Asked of npm itself rather than assumed: the global module root is <prefix>/lib on
+        # most distros but <prefix>/lib64 on lib64 profiles (Gentoo). Read-only, so it also
+        # runs under --check.
+        - name: Resolve where npm keeps this prefix's modules
+          ansible.builtin.command:
+            argv: [npm, root, --global, --prefix, "{{ lsp_npm_prefix }}"]
+          environment:
+            PATH: "{{ lsp_system_path }}"
+          register: _lsp_npm_root
+          changed_when: false
+          failed_when: false
+          check_mode: false
+
+        # Stands down for ONE case: a dry run on a host that has no npm yet (the install above
+        # is a no-op under --check, so there is nothing to ask).
+        - name: Require npm
+          ansible.builtin.assert:
+            that:
+              - _lsp_npm_root.rc == 0
+              - _lsp_npm_root.stdout | trim | length > 0
+            fail_msg: >-
+              pyright is installed with npm, and `npm` is not on PATH
+              ({{ _lsp_npm_root.msg | default(_lsp_npm_root.stderr | default('')) }}).
+              List the paseo role first (it installs Node), install Node yourself, or leave
+              lsp_manage_node on so this role installs the distro's. On Gentoo npm is a USE flag
+              of net-libs/nodejs.
+            quiet: true
+          when: not (ansible_check_mode and _lsp_npm_root.rc != 0)
+
+        - name: Install pyright into its prefix
+          when: _lsp_npm_root.rc == 0
+          block:
+            - name: Read the installed pyright version
+              ansible.builtin.slurp:
+                src: "{{ _lsp_npm_root.stdout | trim }}/{{ lsp_pyright_package }}/package.json"
+              register: _lsp_pyright_pkgjson
+              failed_when: false
+
+            - name: Check for the other pyright flavour
+              ansible.builtin.stat:
+                path: "{{ _lsp_npm_root.stdout | trim }}/{{ _lsp_pyright_other }}/package.json"
+              register: _lsp_pyright_other_stat
+
+            - name: Work out what npm has to do
+              ansible.builtin.set_fact:
+                _lsp_pyright_installed: >-
+                  {{ (_lsp_pyright_pkgjson.content | b64decode | from_json).version
+                     if (_lsp_pyright_pkgjson.content is defined) else '' }}
+
+            - name: Create the npm prefix
+              ansible.builtin.file:
+                path: "{{ lsp_npm_prefix }}"
+                state: directory
+                owner: root
+                group: root
+                mode: "0755"
+
+            # pyright and basedpyright both install `pyright` and `pyright-langserver`; npm
+            # refuses the second with EEXIST. Switching flavours therefore removes the first.
+            - name: Remove the other pyright flavour (same command names)
+              ansible.builtin.shell:
+                cmd: >-
+                  umask 022 && npm uninstall --global --loglevel=error --no-update-notifier
+                  --prefix {{ lsp_npm_prefix | quote }} {{ _lsp_pyright_other | quote }}
+              environment:
+                PATH: "{{ lsp_system_path }}"
+              changed_when: true
+              when: _lsp_pyright_other_stat.stat.exists
+
+            # umask 022: a hardened root umask (077) would otherwise leave a tree no other user
+            # can read, and every editor would report "pyright-langserver: permission denied".
+            # --ignore-scripts: neither flavour needs install scripts, and this runs as root.
+            - name: Install pyright
+              ansible.builtin.shell:
+                cmd: >-
+                  umask 022 && npm install --global --ignore-scripts --no-fund --no-audit
+                  --no-update-notifier --loglevel=error
+                  --prefix {{ lsp_npm_prefix | quote }}
+                  {{ (lsp_pyright_package ~ (('@' ~ lsp_pyright_version) if (lsp_pyright_version | length > 0) else '')) | quote }}
+              environment:
+                PATH: "{{ lsp_system_path }}"
+              changed_when: true
+              when: >-
+                (_lsp_pyright_installed | length == 0)
+                or ((lsp_pyright_version | length > 0) and (_lsp_pyright_installed != lsp_pyright_version))
+
+            # Whatever the package put in <prefix>/bin: pyright + pyright-langserver, and for
+            # basedpyright its own two names as well.
+            - name: List the commands pyright installed
+              ansible.builtin.find:
+                paths: "{{ lsp_npm_prefix }}/bin"
+                file_type: any
+              register: _lsp_pyright_bins
+
+            - name: Link the pyright commands into the command dir
+              ansible.builtin.file:
+                src: "{{ item.path }}"
+                dest: "{{ lsp_bin_dir }}/{{ item.path | basename }}"
+                state: link
+                force: true
+              loop: "{{ _lsp_pyright_bins.files | default([]) | sort(attribute='path') }}"
+              loop_control:
+                label: "{{ item.path | basename }}"
+
+            # Switching flavour back leaves basedpyright's two extra links pointing at files
+            # npm has just removed. Only dead links INTO this role's prefix are touched.
+            - name: Remove command links whose pyright target is gone
+              ansible.builtin.shell:
+                cmd: |
+                  for link in {{ lsp_bin_dir | quote }}/*; do
+                    [ -L "$link" ] || continue
+                    [ -e "$link" ] && continue
+                    case "$(readlink "$link")" in
+                      {{ (lsp_npm_prefix ~ '/') | quote }}*) rm -f "$link" && echo "removed $link" ;;
+                    esac
+                  done
+              register: _lsp_pyright_stale
+              changed_when: "'removed' in (_lsp_pyright_stale.stdout | default(''))"
+      vars:
+        _lsp_pyright_other: "{{ lsp_pyright_flavours | difference([lsp_pyright_package]) | first }}"
+
+    - name: Verify pyright
+      ansible.builtin.include_tasks: verify.yml
+      vars:
+        _lsp_verify_label: pyright
+        _lsp_verify_command: [pyright-langserver, --stdio]
+      when:
+        - lsp_verify | bool
+        - not ansible_check_mode
+
+# ================================================================================================
+# ruff
+# ================================================================================================
+- name: Set up ruff
+  when: "'ruff' in lsp_python_servers"
+  block:
+    - name: Look for a working ruff
+      ansible.builtin.command: ruff --version
+      environment:
+        PATH: "{{ lsp_system_path }}"
+      register: _lsp_ruff_probe
+      changed_when: false
+      failed_when: false
+      check_mode: false
+
+    # ---- distro route (no version pinned) --------------------------------------------------
+    - name: Install ruff from the distro
+      when:
+        - lsp_ruff_version | length == 0
+        - not ((lsp_skip_if_present | bool) and _lsp_ruff_probe.rc == 0)
+      vars:
+        _lsp_ruff_pkgs: >-
+          {{ lsp_ruff_packages
+             if (lsp_ruff_packages | length > 0)
+             else (lsp_ruff_packages_by_family[ansible_facts['os_family']] | default([])) }}
+      block:
+        - name: Require a ruff package for this distro
+          ansible.builtin.assert:
+            that: _lsp_ruff_pkgs | length > 0
+            fail_msg: >-
+              {{ ansible_facts['distribution'] | default(ansible_facts['os_family']) }} has no ruff
+              package. Set lsp_ruff_version (e.g. "0.17.6") to install the official release
+              binary, or drop 'ruff' from lsp_python_servers.
+            quiet: true
+
+        - name: Install the ruff package
+          ansible.builtin.include_tasks: packages.yml
+          vars:
+            _lsp_pkg_label: ruff
+            _lsp_pkgs: "{{ _lsp_ruff_pkgs }}"
+
+    # ---- official release (a version is pinned) --------------------------------------------
+    - name: Install the official ruff release
+      when: lsp_ruff_version | length > 0
+      block:
+        - name: Resolve the release target for this host
+          ansible.builtin.set_fact:
+            _lsp_ruff_target: >-
+              {{ lsp_ruff_target
+                 if (lsp_ruff_target | length > 0)
+                 else ((lsp_arch_map[ansible_facts['architecture']] ~ '-unknown-linux-gnu')
+                       if (ansible_facts['architecture'] in lsp_arch_map) else '') }}
+            _lsp_ruff_prefix: "{{ lsp_install_root }}/ruff-{{ lsp_ruff_version }}"
+
+        - name: Require a known release target
+          ansible.builtin.assert:
+            that: _lsp_ruff_target | length > 0
+            fail_msg: >-
+              No default ruff build for {{ ansible_facts['architecture'] }}. Set lsp_ruff_target
+              to one of the targets on ruff's release page, or leave lsp_ruff_version empty to use
+              the distro package.
+            quiet: true
+
+        - name: Ensure tar + gzip are present
+          ansible.builtin.include_tasks: packages.yml
+          vars:
+            _lsp_pkg_label: download tools
+            _lsp_pkgs: "{{ lsp_download_tools_by_family[ansible_facts['os_family']] | default([]) }}"
+
+        - name: Check whether this ruff version is already unpacked
+          ansible.builtin.stat:
+            path: "{{ _lsp_ruff_prefix }}/ruff"
+          register: _lsp_ruff_prefix_stat
+
+        # Not under --check: nothing is downloaded in a dry run, so there is nothing to unpack.
+        - name: Download + unpack ruff {{ lsp_ruff_version }}
+          when:
+            - not _lsp_ruff_prefix_stat.stat.exists
+            - not ansible_check_mode
+          block:
+            - name: Create a scratch dir for the download
+              ansible.builtin.tempfile:
+                state: directory
+                prefix: ruff-dl.
+              register: _lsp_ruff_tmp
+
+            # get_url first so the optional checksum is verified BEFORE anything is unpacked.
+            # use_netrc: false — a public download needs no credentials, and with it on Ansible
+            # aborts if root's ~/.netrc on the target is group/world readable.
+            - name: Download the ruff release tarball
+              ansible.builtin.get_url:
+                url: "{{ lsp_ruff_release_url }}/{{ lsp_ruff_version }}/ruff-{{ _lsp_ruff_target }}.tar.gz"
+                dest: "{{ _lsp_ruff_tmp.path }}/ruff.tar.gz"
+                checksum: "{{ lsp_ruff_checksum | default(omit, true) }}"
+                mode: "0644"
+                use_netrc: false
+
+            - name: Create the versioned install dir
+              ansible.builtin.file:
+                path: "{{ _lsp_ruff_prefix }}"
+                state: directory
+                owner: root
+                group: root
+                mode: "0755"
+
+            # One top-level directory in the tarball (ruff-<target>/); strip it.
+            - name: Unpack ruff
+              ansible.builtin.unarchive:
+                src: "{{ _lsp_ruff_tmp.path }}/ruff.tar.gz"
+                dest: "{{ _lsp_ruff_prefix }}"
+                remote_src: true
+                owner: root
+                group: root
+                extra_opts:
+                  - --strip-components=1
+          always:
+            - name: Remove the scratch dir
+              ansible.builtin.file:
+                path: "{{ _lsp_ruff_tmp.path }}"
+                state: absent
+              when: _lsp_ruff_tmp.path is defined
+
+        # Older versions stay under the install root; point the link back to roll back.
+        - name: Link the pinned ruff into the command dir
+          ansible.builtin.file:
+            src: "{{ _lsp_ruff_prefix }}/ruff"
+            dest: "{{ lsp_bin_dir }}/ruff"
+            state: link
+            force: true
+
+    - name: Verify ruff
+      ansible.builtin.include_tasks: verify.yml
+      vars:
+        _lsp_verify_label: ruff
+        _lsp_verify_command: [ruff, server]
+      when:
+        - lsp_verify | bool
+        - not ansible_check_mode

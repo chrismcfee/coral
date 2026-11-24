@@ -1,0 +1,84 @@
+---
+# The distro's Rust: toolchain, standard-library source and rust-analyzer as packages — or, on
+# Gentoo, as USE flags of the one Rust package.
+
+- name: Install Rust + rust-analyzer from the distro
+  block:
+    # ---- Gentoo ------------------------------------------------------------------------------
+    - name: Rust + rust-analyzer on Gentoo
+      when: ansible_facts['os_family'] == 'Gentoo'
+      block:
+        # /var/db/pkg/dev-lang/rust-1.99.1 is the source build; rust-bin-1.99.1 is the binary
+        # one. The pattern matches only the former.
+        - name: See whether a source-built dev-lang/rust is installed
+          ansible.builtin.find:
+            paths: /var/db/pkg/dev-lang
+            patterns: "rust-[0-9]*"
+            file_type: directory
+          register: _lsp_gentoo_rust_src_pkg
+
+        - name: See whether dev-lang/rust-bin is installed
+          ansible.builtin.find:
+            paths: /var/db/pkg/dev-lang
+            patterns: "rust-bin-[0-9]*"
+            file_type: directory
+          register: _lsp_gentoo_rust_bin_pkg
+
+        # Extend what is already there rather than adding a second Rust beside it — but only
+        # rust-bin is a quick change. See lsp_rust_gentoo_atom in defaults/.
+        - name: Pick the Rust package to carry rust-analyzer
+          ansible.builtin.set_fact:
+            _lsp_gentoo_rust_atom: >-
+              {{ lsp_rust_gentoo_atom
+                 if (lsp_rust_gentoo_atom | length > 0)
+                 else ('dev-lang/rust'
+                       if ((_lsp_gentoo_rust_src_pkg.matched | default(0)) > 0
+                           and (_lsp_gentoo_rust_bin_pkg.matched | default(0)) == 0)
+                       else 'dev-lang/rust-bin') }}
+
+        - name: Enable the rust-analyzer + rust-src USE flags
+          ansible.builtin.copy:
+            dest: /etc/portage/package.use/coral-lsp-rust
+            content: "{{ _lsp_gentoo_rust_atom }} {{ lsp_rust_gentoo_use | join(' ') }}\n"
+            mode: "0644"
+
+        # changed_use: rebuild only when the flags above actually changed, never just because
+        # the play ran. For rust-bin that is a re-unpack; for dev-lang/rust it is a compile.
+        - name: Install Rust with rust-analyzer + rust-src (Gentoo)
+          community.general.portage:
+            package: "{{ _lsp_gentoo_rust_atom }}"
+            state: present
+            changed_use: true
+
+    # ---- everyone else -----------------------------------------------------------------------
+    - name: Rust + rust-analyzer packages
+      when: ansible_facts['os_family'] != 'Gentoo'
+      vars:
+        _lsp_rust_pkgs: >-
+          {{ lsp_rust_packages
+             if (lsp_rust_packages | length > 0)
+             else (lsp_rust_packages_by_family[ansible_facts['os_family']] | default([])) }}
+      block:
+        - name: Require a package list for this distro
+          ansible.builtin.assert:
+            that: _lsp_rust_pkgs | length > 0
+            fail_msg: "No built-in Rust package list for os_family {{ ansible_facts['os_family'] }}."
+            quiet: true
+
+        - name: Install the Rust packages
+          ansible.builtin.include_tasks: packages.yml
+          vars:
+            _lsp_pkg_label: Rust + rust-analyzer
+            _lsp_pkgs: "{{ _lsp_rust_pkgs }}"
+
+  # The package manager's own error first, then what to do about the two usual causes.
+  rescue:
+    - name: Explain the failed Rust package install
+      ansible.builtin.fail:
+        msg: >-
+          Could not install Rust + rust-analyzer from the distro:
+          {{ ansible_failed_result.msg | default('see the failed task above') | string | truncate(600) }}
+          Usual causes: (1) the release has no rust-analyzer package (Debian 12, Ubuntu), or
+          (2) another Rust already owns those files, e.g. Arch's `rustup` package. Either way,
+          set lsp_rust_toolchain (e.g. "stable" or "1.100.0") to install the official toolchain
+          under {{ lsp_rust_root }} instead; that leaves the distro's Rust packages alone.

@@ -1,0 +1,65 @@
+---
+# Emacs: the binary, a version gate, and — optionally — Doom Emacs for editors_user.
+
+- name: Look for an existing emacs
+  ansible.builtin.shell: command -v emacs
+  environment:
+    PATH: "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+  register: _editors_emacs_which
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+# Skipped when emacs is already there (see editors_skip_if_present). That matters most on Arch,
+# where the default emacs-nox CONFLICTS with an installed `emacs`, and on Gentoo, where it saves
+# rebuilding Emacs just to arrive at the same binary.
+- name: Install Emacs from the distro
+  ansible.builtin.include_tasks: packages.yml
+  vars:
+    _editors_pkg_label: Emacs
+    _editors_pkgs: >-
+      {{ editors_emacs_packages
+         if (editors_emacs_packages | length > 0)
+         else (editors_emacs_packages_by_family[ansible_facts['os_family']] | default([])) }}
+  when: not ((editors_skip_if_present | bool) and _editors_emacs_which.rc == 0)
+
+- name: Query the Emacs version
+  ansible.builtin.command: emacs --version
+  environment:
+    PATH: "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+  register: _editors_emacs_ver
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+# Skipped under --check on a host that doesn't have emacs yet (the install above is a no-op there).
+- name: Assert Emacs is installed
+  ansible.builtin.assert:
+    that: _editors_emacs_ver.rc == 0
+    fail_msg: >-
+      emacs not found on PATH after install. Check the package name for this distro
+      (editors_emacs_packages).
+    quiet: true
+  when: not ansible_check_mode
+
+# First line is "GNU Emacs 30.1".
+- name: Record the Emacs version
+  ansible.builtin.set_fact:
+    _editors_emacs_version: >-
+      {{ (_editors_emacs_ver.stdout_lines | default([]) | first | default(''))
+         | regex_search('[0-9]+[.][0-9]+([.][0-9]+)?') | default('', true) }}
+
+- name: Assert Emacs meets the minimum version
+  ansible.builtin.assert:
+    that: _editors_emacs_version is version(editors_emacs_min_version, '>=')
+    fail_msg: >-
+      Emacs {{ editors_emacs_min_version }}+ is required but the host has
+      {{ _editors_emacs_version | default('?', true) }}.
+    quiet: true
+  when:
+    - editors_emacs_min_version | length > 0
+    - _editors_emacs_version | length > 0
+
+- name: Set up Doom Emacs
+  ansible.builtin.include_tasks: doom.yml
+  when: editors_emacs_doom | bool

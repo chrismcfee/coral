@@ -10,19 +10,22 @@ Wants=network-online.target{% if paseo_after_netbird %} {{ paseo_netbird_unit }}
 Type=simple
 User={{ paseo_user }}
 Group={{ paseo_group }}
-# OpenCode provider secrets (and anything else the daemon's subprocesses need) live here. Leading
+# Agent provider secrets (and anything else the daemon's subprocesses need) live here. Leading
 # '-' => optional, so the unit still starts if the file is absent. The explicit Environment= lines
 # below win over anything in the file, so a stray PATH/PASEO_HOME there can't break the daemon.
 EnvironmentFile=-{{ paseo_env_file }}
 Environment=PASEO_HOME={{ paseo_state_dir }}
-# PATH so the daemon can find the agent CLI (opencode/claude/codex) it launches as a subprocess.
+# PATH so the daemon can find the agent CLI (opencode/claude/kimi) it launches as a subprocess.
 Environment=PATH={{ paseo_service_path }}
-# NOTE: listen/hostnames are owned by config.json. Do NOT add PASEO_LISTEN here — env overrides
+# NOTE: listen/hostnames are owned by config.json. Do NOT add PASEO_LISTEN (or any other PASEO_*
+# daemon setting) here or to the env file — in foreground mode the environment overrides
 # config.json (precedence trap) and you'll wonder why config edits "do nothing".
 #
-# `daemon start` self-detaches and exits 0. We run it in the foreground ({{ paseo_foreground_flag | default('(no flag set!)', true) }})
-# so the worker is the main PID and Restart= actually supervises it. Verify the flag on your build.
-ExecStart={{ paseo_bin }} daemon start{% if paseo_foreground_flag %} {{ paseo_foreground_flag }}{% endif %}
+# `daemon start` self-detaches and exits 0, so the daemon is run in the FOREGROUND instead: systemd
+# then supervises a process that stays alive and Restart= actually works. The sub-command below was
+# chosen by asking the installed CLI (tasks/service.yml): `daemon run` on @getpaseo/cli >= 0.9.0,
+# `daemon start --foreground` before that. The two are mutually exclusive.
+ExecStart={{ paseo_bin }} {{ _paseo_foreground_command }}
 
 Restart=on-failure
 RestartSec={{ paseo_restart_sec }}

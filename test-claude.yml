@@ -2,8 +2,11 @@
 # Live smoke test for the Claude Code agent path. Installs a REAL Paseo daemon plus Claude Code on
 # the target, as the dedicated paseo user. Run from the repo root:
 #
-#     ansible-playbook -i inventory.yml test-claude.yml --limit <host> --check   # dry run first
 #     ansible-playbook -i inventory.yml test-claude.yml --limit <host>
+#     ansible-playbook -i inventory.yml test-claude.yml --limit <host> --check   # later: preview a change
+#
+# --check is for a host that has been provisioned at least once: a dry run cannot create the
+# paseo user, so on a brand-new host it stops at the first task that has to run as that user.
 #
 # Pass a real key to exercise auth end-to-end (otherwise the CLI installs and reports available,
 # but the first prompt fails — availability does not check credentials):
@@ -26,6 +29,6 @@
     paseo_deploy_opencode_config: false
 
     paseo_install_claude: true
-    paseo_claude_version: "2.1.212"     # pin, so a re-run is a genuine no-op test
+    paseo_claude_version: "2.1.325"     # pin, so a re-run is a genuine no-op test
   roles:
     - paseo

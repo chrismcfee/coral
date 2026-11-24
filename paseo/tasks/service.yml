@@ -5,13 +5,33 @@
 # so it's only created when there are secrets to write.
 #
 # ONE file for ALL agents. There is exactly one EnvironmentFile= / one sourced file, and Ansible
-# dicts don't merge across var files, so the two per-agent dicts are unioned HERE rather than each
+# dicts don't merge across var files, so the per-agent dicts are unioned HERE rather than each
 # feeding its own file. Gating on the union matters: gating on the OpenCode dict alone would leave
-# a Claude-only host with no env file, and ANTHROPIC_API_KEY would silently never reach the daemon.
+# a Claude-only or Kimi-only host with no env file, and its credential would silently never reach
+# the daemon. A new agent's secrets dict MUST be added to this union, or it is written nowhere.
 - name: Compose the union of agent secrets
   ansible.builtin.set_fact:
-    _paseo_agent_secrets: "{{ paseo_opencode_secrets | combine(paseo_claude_secrets) }}"
+    _paseo_agent_secrets: >-
+      {{ paseo_opencode_secrets
+         | combine(paseo_claude_secrets)
+         | combine(paseo_kimicode_secrets) }}
   no_log: "{{ paseo_no_log }}"
+
+# The daemon reads its own settings from this same environment, so a secret that happens to use one
+# of those names changes how the daemon runs: under systemd (foreground mode) it OVERRIDES
+# config.json, and from @getpaseo/cli 0.9 OpenRC's `daemon start` strips it before any agent is
+# launched. Either way it is not doing what a key in an "agent secrets" dict was meant to do. Names
+# only — never values. Non-fatal: the play continues, the operator decides.
+- name: Warn about agent secrets that shadow daemon settings
+  ansible.builtin.debug:
+    msg: >-
+      *** These keys in the agent secrets are Paseo DAEMON settings, not agent credentials:
+      {{ _paseo_agent_secrets.keys() | select('in', paseo_daemon_setting_env_keys) | sort | join(', ') }}.
+      Under systemd they override config.json (PASEO_PASSWORD replaces the password this role
+      manages; PASEO_LISTEN/PORT change the bind); under OpenRC with @getpaseo/cli >= 0.9 they are
+      stripped before the agent starts. Rename them — e.g. PASEO_TOKEN for a bearer the agent
+      sends back to Paseo — or remove them.
+  when: _paseo_agent_secrets.keys() | select('in', paseo_daemon_setting_env_keys) | list | length > 0
 
 - name: Ensure the env-file directory exists
   ansible.builtin.file:
@@ -32,6 +52,46 @@
   no_log: true
   when: _paseo_agent_secrets | length > 0
   notify: restart paseo
+
+# How to keep the daemon in the foreground depends on the INSTALLED CLI, and the two forms are
+# mutually exclusive: `daemon run` does not exist before 0.9.0, and from 0.9.0 `daemon start
+# --foreground` exits 1 ("--foreground was removed"). So ask the binary instead of guessing.
+#
+# The probe matches the sub-command's OWN usage line, not the exit code: commander answers
+# `daemon run --help` on a CLI without `run` by printing the parent `daemon` help and exiting 0,
+# so rc alone reports every legacy CLI as modern. (Checked against 0.1.101 and 0.17.4.)
+# check_mode: false — read-only, so a dry run templates the same unit a real run would.
+- name: Ask the installed Paseo CLI how it runs in the foreground
+  ansible.builtin.command:
+    argv:
+      - "{{ paseo_bin }}"
+      - daemon
+      - run
+      - --help
+  environment:
+    HOME: "{{ paseo_home_dir }}"
+    PASEO_HOME: "{{ paseo_state_dir }}"
+    PATH: "{{ paseo_service_path }}"
+  become: true
+  become_user: "{{ paseo_user }}"
+  register: _paseo_daemon_run_probe
+  changed_when: false
+  failed_when: false
+  check_mode: false
+  when:
+    - paseo_init_system == 'systemd'
+    - paseo_daemon_foreground_command | length == 0
+
+- name: Decide the foreground launch command
+  ansible.builtin.set_fact:
+    _paseo_foreground_command: >-
+      {{ paseo_daemon_foreground_command
+         if (paseo_daemon_foreground_command | length > 0)
+         else ('daemon run'
+               if ((_paseo_daemon_run_probe.stdout | default(''))
+                   is search('Usage: +[^ ]+ +daemon +run( |$)'))
+               else (('daemon start ' ~ paseo_foreground_flag) | trim)) }}
+  when: paseo_init_system == 'systemd'
 
 - name: Install systemd unit
   ansible.builtin.template:

@@ -7,14 +7,18 @@ description="Paseo daemon"
 : ${PASEO_HOME:={{ paseo_state_dir }}}
 : ${PASEO_ENV_FILE:={{ paseo_env_file }}}
 PASEO_BIN="{{ paseo_bin }}"
-# PATH so the daemon finds the agent CLI (opencode) it spawns.
+# PATH so the daemon finds the agent CLI (opencode/claude/kimi) it spawns.
 PASEO_PATH="{{ paseo_service_path }}"
 export PASEO_HOME
 
 # Delegation wrapper: paseo's own `daemon start` self-detaches, so we do NOT set
 # command_background (that double-backgrounds it -> status reports "crashed" while the daemon is
-# fine, plus orphan workers on restart). Tradeoff: no auto-restart-on-crash. For that, point
-# supervise-daemon at paseo's foreground mode instead (see README).
+# fine, plus orphan workers on restart). `daemon start` exists with the same meaning on every CLI
+# version, unlike the foreground form systemd uses, so this script needs no version switch.
+#
+# Crash handling: `daemon start` launches Paseo's own supervisor, which restarts a crashed worker
+# by itself. What OpenRC does not give you is a restart of that supervisor if IT dies — for that,
+# point supervise-daemon at paseo's foreground mode instead (see README).
 
 depend() {
     need net
@@ -25,8 +29,10 @@ depend() {
 
 start() {
     ebegin "Starting paseo"
-    # Source the daemon env file (OpenCode provider secrets) inside the su so the spawned opencode
+    # Source the daemon env file (agent provider secrets) inside the su so the spawned agent CLI
     # inherits it; `set -a` exports every assignment. Optional: skipped cleanly if the file is absent.
+    # From @getpaseo/cli 0.9, `daemon start` drops its own setting names (PASEO_PASSWORD,
+    # PASEO_LISTEN, PORT, …) from what it passes on; every other variable reaches the agents.
     su -s /bin/sh "$PASEO_USER" -c "set -a; [ -r '$PASEO_ENV_FILE' ] && . '$PASEO_ENV_FILE'; set +a; PATH='$PASEO_PATH' PASEO_HOME='$PASEO_HOME' '$PASEO_BIN' daemon start"
     eend $?
 }

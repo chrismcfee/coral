@@ -16,13 +16,16 @@
     home: "{{ paseo_home_dir }}"
     shell: "{{ paseo_user_shell }}"
 
+# 0700, not 0750: the daemon itself re-tightens PASEO_HOME to owner-only at startup (observed on
+# 0.17.4), so any looser mode here is undone on the next start and reported "changed" on every
+# play. It holds the password hash and the daemon keypair; nothing else needs to read it.
 - name: Ensure PASEO_HOME state directory
   ansible.builtin.file:
     path: "{{ paseo_state_dir }}"
     state: directory
     owner: "{{ paseo_user }}"
     group: "{{ paseo_group }}"
-    mode: "0750"
+    mode: "0700"
 
 # Guarantee a valid JSON file exists before set-password / the config merge touch it.
 # force:false => never clobbers a real config (or a generated keypair's neighbours).
@@ -55,9 +58,12 @@
     - paseo_manage_node | bool
     - ansible_os_family == 'Gentoo'
 
+# The atom is dev-util/github-cli (checked with `emerge --pretend` against the current tree).
+# dev-vcs/github-cli — what this task used to ask for — has never existed, so the task failed on
+# every Gentoo host that left paseo_install_github_cli at its default of true.
 - name: Install GitHub CLI (Gentoo)
   community.general.portage:
-    package: dev-vcs/github-cli
+    package: dev-util/github-cli
     state: present
   when:
     - paseo_install_github_cli | bool
@@ -115,12 +121,18 @@
 # ----------------------------------------------------------------------------
 # Version gate — fail fast on too-old Node (distro packages on the Pi, etc.)
 # ----------------------------------------------------------------------------
+# check_mode: false — a read-only probe. Without it the command is skipped under --check, stdout
+# is empty, and the version gate below fails every dry run, even on a correctly provisioned host.
 - name: Query Node.js version
   ansible.builtin.command: node --version
   register: _paseo_node_version
   changed_when: false
   failed_when: false
+  check_mode: false
 
+# Both gates stand down for ONE case: a dry run on a host that has no Node yet. The install tasks
+# above are no-ops under --check, so there is nothing to measure — failing would only say "Node is
+# missing" about a host the real run is about to install it on.
 - name: Assert Node.js is installed
   ansible.builtin.assert:
     that: _paseo_node_version.rc == 0
@@ -128,6 +140,7 @@
       Node.js not found on PATH. Set paseo_manage_node: true, or install Node {{ paseo_min_node_major }}+
       yourself before running this role.
     quiet: true
+  when: not (ansible_check_mode and _paseo_node_version.rc != 0)
 
 - name: Assert Node.js meets the minimum major version
   ansible.builtin.assert:
@@ -137,6 +150,7 @@
       On Debian/Ubuntu the distro Node is usually too old — install from NodeSource and re-run,
       or set paseo_manage_node: false and provide a newer Node yourself.
     quiet: true
+  when: not (ansible_check_mode and _paseo_node_version.rc != 0)
 
 # ----------------------------------------------------------------------------
 # Per-user npm prefix + the Paseo CLI
@@ -179,9 +193,13 @@
   register: _paseo_npm_root_g
   changed_when: false
 
+# Only when the probe produced a path: under --check the command above is skipped and returns an
+# empty stdout, which would turn this into "/@getpaseo/cli". The default from defaults/main.yml
+# stays in place for a dry run.
 - name: Set the Paseo CLI package dir from npm's real global root
   ansible.builtin.set_fact:
     paseo_cli_pkg_dir: "{{ _paseo_npm_root_g.stdout | trim }}/{{ paseo_cli_package }}"
+  when: (_paseo_npm_root_g.stdout | default('') | trim | length) > 0
 
 - name: Symlink the paseo CLI into /usr/local/bin
   ansible.builtin.file:

@@ -64,8 +64,9 @@
   ansible.builtin.import_tasks: kimicode.yml
   when:
     - paseo_install_kimicode | bool
-    - (paseo_deploy_kimicode_settings | bool)
+    - (paseo_kimicode_config_src | length > 0)
       or (paseo_register_kimicode_provider | bool)
+      or (paseo_verify_kimicode_credential | bool)
 
 - name: Grab the daemon config back to the controller
   ansible.builtin.import_tasks: fetch_daemon_config.yml

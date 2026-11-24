@@ -1,0 +1,32 @@
+---
+# Smoke test for the `lsp` role on ONE host. Run from the repo root:
+#
+#     ansible-playbook -i inventory.yml test-lsp.yml --limit <host> --check   # dry run first
+#     ansible-playbook -i inventory.yml test-lsp.yml --limit <host>
+#     ansible-playbook -i inventory.yml test-lsp-verify.yml --limit <host>    # then prove it works
+#
+# As written this installs BOTH languages the simple way: pyright from npm, ruff and the whole
+# Rust set (toolchain, rust-src, rust-analyzer) from the distro. That is right for Fedora, Arch
+# and Gentoo. Elsewhere, add the pieces the distro lacks:
+#
+#   Debian 13 — no ruff package:
+#     -e lsp_ruff_version=0.17.6
+#
+#   Debian 12, Ubuntu — no ruff package, and no rust-analyzer package that fits:
+#     -e lsp_ruff_version=0.17.6 -e lsp_rust_toolchain=1.100.0
+#
+#   Gentoo — works as written, but rust-analyzer is a USE flag of the Rust package: quick for
+#   dev-lang/rust-bin, a rebuild of the compiler for a source-built dev-lang/rust. The official
+#   toolchain leaves portage's Rust alone:
+#     -e lsp_rust_toolchain=1.100.0
+#
+#   One language only:
+#     -e lsp_install_rust=false        or        -e lsp_install_python=false
+- name: Language servers smoke test
+  hosts: all
+  become: true
+  vars:
+    lsp_install_python: true
+    lsp_install_rust: true
+  roles:
+    - lsp

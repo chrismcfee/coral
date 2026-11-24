@@ -1,0 +1,119 @@
+---
+# =============================================================================
+# homelab.lsp — language servers for a dev host: Python (pyright, ruff) and Rust (rust-analyzer
+# plus the toolchain it cannot work without).
+#
+# EVERYTHING HERE IS OPT-IN: with the defaults the role installs nothing, so it is safe to list
+# in a fleet play and switch on per host or group.
+#
+# One install serves every consumer. Neovim, Emacs/Doom, OpenCode and Claude Code all start a
+# language server the same way — by COMMAND NAME from PATH (`pyright-langserver`,
+# `rust-analyzer`). So the role installs system-wide and links each command into lsp_bin_dir,
+# which is on every PATH this repo bakes in, including the paseo daemon's. Nothing here is
+# per-user, and nothing needs the paseo role.
+# =============================================================================
+
+# Where commands are linked so every consumer finds them. /usr/local/bin precedes /usr/bin, so a
+# pinned build from this role wins over a distro copy without removing it.
+lsp_bin_dir: /usr/local/bin
+
+# Pinned / official builds are unpacked under here, root-owned and read-only to everyone else.
+lsp_install_root: /opt
+
+# Leave a server that already works alone, however it got there (distro package, a hand
+# install): no packages are added or changed for it. It only guards the UNPINNED routes — asking
+# for a specific version below always installs that version.
+lsp_skip_if_present: true
+
+# After installing, start each server and complete a real LSP `initialize` handshake — as
+# lsp_verify_user, not root, so an install only root can read fails here instead of in your
+# editor. "The binary is on PATH" proves very little: rustup's rust-analyzer shim is on PATH
+# whether or not the component is installed, and a server can be missing its runtime (Node).
+lsp_verify: true
+lsp_verify_user: nobody              # "" = run the server as the play's own user (root). Dropping
+                                     # privileges needs Python 3.9+ on the target.
+lsp_verify_timeout: 60
+
+# =============================================================================
+# Python
+# =============================================================================
+lsp_install_python: false
+
+# Which servers. They do different jobs and editors run them side by side:
+#   pyright — types, completion, go-to-definition. The one command every consumer here knows.
+#   ruff    — lint + format (`ruff server`). Drop it from the list if you don't want it.
+lsp_python_servers:
+  - pyright
+  - ruff
+
+# --- pyright ------------------------------------------------------------------------------------
+# Installed with npm (its only official channel) into a prefix of its own, never the system one.
+#
+# lsp_pyright_package: "basedpyright" swaps in the community fork. Its npm package installs
+# `pyright-langserver` as well as `basedpyright-langserver`, so everything that asks for the
+# former keeps working — which is why this is a package choice and not a different server.
+lsp_pyright_package: pyright
+lsp_pyright_version: ""              # "" = newest at FIRST install, then left alone; pin e.g. "1.1.414"
+lsp_npm_prefix: "{{ lsp_install_root }}/lsp-npm"
+
+# pyright runs on Node. With the paseo role in the play Node is already there; standalone, this
+# installs the distro's nodejs + npm when (and only when) `npm` is not on PATH.
+lsp_manage_node: true
+lsp_node_packages: []                # override the distro package list; [] = built-in per family
+
+# --- ruff ---------------------------------------------------------------------------------------
+#   ""        the distro package (Fedora, Arch, Gentoo; Debian and Ubuntu have none)
+#   "0.17.6"  the official release binary, unpacked to <lsp_install_root>/ruff-0.17.6
+lsp_ruff_version: ""
+lsp_ruff_checksum: ""                # optional "sha256:<hex>" for the release tarball
+lsp_ruff_target: ""                  # "" = <arch>-unknown-linux-gnu; set e.g. x86_64-unknown-linux-musl
+lsp_ruff_release_url: "https://github.com/astral-sh/ruff/releases/download"
+lsp_ruff_packages: []                # override the distro package list
+
+# =============================================================================
+# Rust
+# =============================================================================
+lsp_install_rust: false
+
+# rust-analyzer is only as good as the toolchain beside it: it shells out to cargo and rustc, and
+# without the standard library's SOURCE (rust-src) it cannot complete or navigate anything in
+# std. So this is always a set — toolchain, rust-src, rust-analyzer — from ONE origin:
+#
+#   ""         the distro's packages (Fedora, Arch, Gentoo, Debian 13+ — Debian 12 and Ubuntu
+#              have no rust-analyzer package that fits their default compiler)
+#   "1.100.0"  the official toolchain of that version, installed with rustup under lsp_rust_root
+#   "stable"   same, following the channel — installed once, moved only by lsp_rust_update
+#
+# Either way it is a FIXED, system-wide toolchain, like a distro package: every user and the
+# daemon get the same one, and nobody but root can change it. That is deliberate (reproducible
+# hosts), and it means a project's rust-toolchain.toml is NOT honoured — rustup's per-project
+# switching lives in its shims, which this role does not put on PATH. See the README.
+lsp_rust_toolchain: ""
+
+# rustup route: components added to the toolchain. The first two are what make it a language
+# server install; rustfmt backs rust-analyzer's formatting and clippy is the usual check command.
+lsp_rust_components:
+  - rust-analyzer
+  - rust-src
+  - clippy
+  - rustfmt
+
+# rustup route, channel names only ("stable", "beta", "nightly"): run `rustup update` for the
+# toolchain on every play. Off = the host keeps what it first installed until you say otherwise.
+lsp_rust_update: false
+
+lsp_rust_root: "{{ lsp_install_root }}/rust"      # holds rustup/ (toolchains) and cargo/ (rustup itself)
+lsp_rust_target: ""                               # "" = <arch>-unknown-linux-gnu
+lsp_rustup_init_url: "https://static.rust-lang.org/rustup/dist"
+lsp_rustup_init_checksum: ""                      # optional "sha256:<hex>" for rustup-init
+
+lsp_rust_packages: []                # distro route: override the package list
+
+# Gentoo, distro route: rust-analyzer and rust-src are USE flags of the Rust package itself.
+#   ""  = auto: extend dev-lang/rust if that (source-built) one is what's installed, otherwise
+#         use dev-lang/rust-bin.
+# Extending a source-built dev-lang/rust RECOMPILES THE COMPILER. To avoid that, name
+# dev-lang/rust-bin here, or use the rustup route (lsp_rust_toolchain) and leave portage alone.
+# The flags go in /etc/portage/package.use/coral-lsp-rust, so package.use must be a directory
+# (it is on a stock install; the paseo role assumes the same).
+lsp_rust_gentoo_atom: ""

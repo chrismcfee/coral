@@ -1,0 +1,226 @@
+---
+# Neovim: the binary (distro package OR the official release tarball), a version gate, and —
+# optionally — a config plus a headless plugin bootstrap.
+
+# ---- binary ------------------------------------------------------------------------------------
+- name: Look for an existing nvim
+  ansible.builtin.shell: command -v nvim
+  environment:
+    PATH: "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+  register: _editors_nvim_which
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+# Package route — only when no version is pinned. Skipped when nvim is already there (see
+# editors_skip_if_present): a hand-installed Neovim should not gain an older distro twin.
+- name: Install Neovim from the distro
+  ansible.builtin.include_tasks: packages.yml
+  vars:
+    _editors_pkg_label: Neovim
+    _editors_pkgs: >-
+      {{ editors_neovim_packages
+         if (editors_neovim_packages | length > 0)
+         else (editors_neovim_packages_by_family[ansible_facts['os_family']] | default([])) }}
+  when:
+    - editors_neovim_version | length == 0
+    - not ((editors_skip_if_present | bool) and _editors_nvim_which.rc == 0)
+
+# Tarball route — the official build, identical on every distro and pinned to one version.
+- name: Install Neovim from the official release tarball
+  when: editors_neovim_version | length > 0
+  block:
+    - name: Resolve the release asset for this architecture
+      ansible.builtin.set_fact:
+        _editors_nvim_arch: "{{ editors_neovim_arch_map[ansible_facts['architecture']] | default('') }}"
+        _editors_nvim_prefix: "{{ editors_neovim_install_root }}/nvim-{{ editors_neovim_version }}"
+
+    - name: Require a supported architecture
+      ansible.builtin.assert:
+        that: _editors_nvim_arch | length > 0
+        fail_msg: >-
+          Neovim publishes Linux release tarballs for x86_64 and aarch64 only; this host is
+          {{ ansible_facts['architecture'] }}. Leave editors_neovim_version empty to use the distro package.
+        quiet: true
+
+    - name: Ensure tar + gzip are present
+      ansible.builtin.include_tasks: packages.yml
+      vars:
+        _editors_pkg_label: tarball tools
+        _editors_pkgs: "{{ editors_neovim_tarball_tools_by_family[ansible_facts['os_family']] | default([]) }}"
+
+    - name: Check whether this Neovim version is already unpacked
+      ansible.builtin.stat:
+        path: "{{ _editors_nvim_prefix }}/bin/nvim"
+      register: _editors_nvim_prefix_stat
+
+    # Not under --check: nothing is downloaded in a dry run, so there would be nothing to unpack.
+    - name: Download + unpack Neovim {{ editors_neovim_version }}
+      when:
+        - not _editors_nvim_prefix_stat.stat.exists
+        - not ansible_check_mode
+      block:
+        - name: Create a scratch dir for the download
+          ansible.builtin.tempfile:
+            state: directory
+            prefix: nvim-dl.
+          register: _editors_nvim_tmp
+
+        # get_url first (not unarchive straight from the URL) so the optional checksum is
+        # verified BEFORE anything is unpacked into the install root.
+        # use_netrc: false — a public download needs no credentials, and with it on Ansible
+        # aborts before sending anything if root's ~/.netrc on the target is group/world readable.
+        - name: Download the Neovim release tarball
+          ansible.builtin.get_url:
+            url: "{{ editors_neovim_release_url }}/v{{ editors_neovim_version }}/nvim-linux-{{ _editors_nvim_arch }}.tar.gz"
+            dest: "{{ _editors_nvim_tmp.path }}/nvim.tar.gz"
+            checksum: "{{ editors_neovim_checksum | default(omit, true) }}"
+            mode: "0644"
+            use_netrc: false
+
+        - name: Create the versioned install dir
+          ansible.builtin.file:
+            path: "{{ _editors_nvim_prefix }}"
+            state: directory
+            owner: root
+            group: root
+            mode: "0755"
+
+        # The tarball has one top-level directory (nvim-linux-<arch>/); strip it so the tree
+        # lands directly in the versioned prefix.
+        - name: Unpack Neovim
+          ansible.builtin.unarchive:
+            src: "{{ _editors_nvim_tmp.path }}/nvim.tar.gz"
+            dest: "{{ _editors_nvim_prefix }}"
+            remote_src: true
+            owner: root
+            group: root
+            extra_opts:
+              - --strip-components=1
+      always:
+        - name: Remove the scratch dir
+          ansible.builtin.file:
+            path: "{{ _editors_nvim_tmp.path }}"
+            state: absent
+          when: _editors_nvim_tmp.path is defined
+
+    # /usr/local/bin precedes /usr/bin on every PATH this repo bakes in, so the pinned build
+    # wins over a distro copy without having to remove it. Older versions stay under the install
+    # root; point the symlink back to roll back.
+    - name: Symlink the pinned nvim into /usr/local/bin
+      ansible.builtin.file:
+        src: "{{ _editors_nvim_prefix }}/bin/nvim"
+        dest: /usr/local/bin/nvim
+        state: link
+        force: true
+
+# ---- version gate ------------------------------------------------------------------------------
+- name: Query the Neovim version
+  ansible.builtin.command: nvim --version
+  environment:
+    PATH: "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+  register: _editors_nvim_ver
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+# Skipped under --check on a host that doesn't have nvim yet: the install tasks above are no-ops
+# in check mode, so asserting here would fail the dry run instead of reporting the change.
+- name: Assert Neovim is installed
+  ansible.builtin.assert:
+    that: _editors_nvim_ver.rc == 0
+    fail_msg: >-
+      nvim not found on PATH after install. On RHEL-likes the package comes from EPEL; elsewhere
+      check the package name (editors_neovim_packages) or pin editors_neovim_version to use the
+      official tarball.
+    quiet: true
+  when: not ansible_check_mode
+
+# First line is "NVIM v0.12.6" (dev builds append "-dev-…", which the pattern stops before).
+- name: Record the Neovim version
+  ansible.builtin.set_fact:
+    _editors_nvim_version: >-
+      {{ (_editors_nvim_ver.stdout_lines | default([]) | first | default(''))
+         | regex_search('[0-9]+[.][0-9]+[.][0-9]+') | default('', true) }}
+
+- name: Assert Neovim meets the minimum version
+  ansible.builtin.assert:
+    that: _editors_nvim_version is version(editors_neovim_min_version, '>=')
+    fail_msg: >-
+      This config needs Neovim {{ editors_neovim_min_version }}+ but the host has
+      {{ _editors_nvim_version | default('?', true) }}. Distro packages lag badly on Debian/Ubuntu —
+      set editors_neovim_version (e.g. "0.12.6") to install the official release instead.
+    quiet: true
+  when:
+    - editors_neovim_min_version | length > 0
+    - _editors_nvim_version | length > 0
+
+# ---- config + plugin bootstrap -----------------------------------------------------------------
+- name: Deploy the Neovim config
+  when: (editors_neovim_config_src | length > 0) or (editors_neovim_config_repo | length > 0)
+  block:
+    - name: Put the Neovim config in place
+      ansible.builtin.include_tasks: config_source.yml
+      vars:
+        _cfg_label: Neovim config
+        _cfg_dest: "{{ editors_neovim_config_dir }}"
+        _cfg_src: "{{ editors_neovim_config_src }}"
+        _cfg_repo: "{{ editors_neovim_config_repo }}"
+        _cfg_version: "{{ editors_neovim_config_version }}"
+        _cfg_update: "{{ editors_neovim_config_update }}"
+
+    - name: Remember whether the Neovim config changed
+      ansible.builtin.set_fact:
+        _editors_nvim_cfg_changed: "{{ _editors_cfg_changed | bool }}"
+
+    - name: Ensure the role's marker dir exists
+      ansible.builtin.file:
+        path: "{{ editors_state_dir }}"
+        state: directory
+        owner: "{{ editors_user }}"
+        group: "{{ editors_group }}"
+        mode: "0755"
+
+    - name: Check for a completed Neovim bootstrap
+      ansible.builtin.stat:
+        path: "{{ editors_state_dir }}/neovim-bootstrap.done"
+      register: _editors_nvim_marker
+
+    # Re-run when the config changed OR the last attempt never finished (no marker) — so a
+    # bootstrap that died on a flaky network is retried next play instead of being forgotten.
+    # The marker is dropped first for the same reason: a failed re-run must not leave a stale
+    # "done" behind.
+    - name: Clear the bootstrap marker before re-running
+      ansible.builtin.file:
+        path: "{{ editors_state_dir }}/neovim-bootstrap.done"
+        state: absent
+      when:
+        - editors_neovim_bootstrap | bool
+        - _editors_nvim_cfg_changed | bool
+
+    - name: Install the Neovim config's plugins (headless)
+      ansible.builtin.command:
+        argv: "{{ editors_neovim_bootstrap_command }}"
+      environment:
+        HOME: "{{ editors_home }}"
+        PATH: "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+        GIT_TERMINAL_PROMPT: "0"
+      become: true
+      become_user: "{{ editors_user }}"
+      register: _editors_nvim_bootstrap
+      changed_when: true
+      timeout: "{{ editors_bootstrap_timeout }}"
+      when:
+        - editors_neovim_bootstrap | bool
+        - (_editors_nvim_cfg_changed | bool) or (not _editors_nvim_marker.stat.exists)
+
+    - name: Mark the Neovim bootstrap complete
+      ansible.builtin.copy:
+        content: "{{ editors_neovim_bootstrap_command | join(' ') }}\n"
+        dest: "{{ editors_state_dir }}/neovim-bootstrap.done"
+        owner: "{{ editors_user }}"
+        group: "{{ editors_group }}"
+        mode: "0644"
+      when:
+        - editors_neovim_bootstrap | bool
+        - _editors_nvim_bootstrap is not skipped

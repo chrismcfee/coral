@@ -1,0 +1,40 @@
+---
+# Internal — package names per OS family (ansible_facts['os_family']). Override the *public* knobs in defaults/ instead
+# (editors_neovim_packages / editors_emacs_packages / editors_support_packages take a plain list
+# and replace the entry for the host's own family).
+
+editors_neovim_packages_by_family:
+  Gentoo: [app-editors/neovim]
+  Debian: [neovim]
+  RedHat: [neovim]              # Fedora; on RHEL-likes this comes from EPEL
+  Archlinux: [neovim]
+
+# The -nox builds: these are headless hosts, and the GUI variants pull in a desktop's worth of
+# dependencies. Gentoo has one package; whether it builds a GUI is a USE-flag decision.
+editors_emacs_packages_by_family:
+  Gentoo: [app-editors/emacs]
+  Debian: [emacs-nox]
+  RedHat: [emacs-nox]
+  Archlinux: [emacs-nox]
+
+# git, ripgrep, fd. Debian's fd package installs the binary as `fdfind`; Doom and the common
+# Neovim pickers look for both names.
+editors_support_packages_by_family:
+  Gentoo: [dev-vcs/git, sys-apps/ripgrep, sys-apps/fd]
+  Debian: [git, ripgrep, fd-find]
+  RedHat: [git, ripgrep, fd-find]      # ripgrep + fd-find are EPEL on RHEL-likes
+  Archlinux: [git, ripgrep, fd]
+
+# Needed to fetch and unpack the official Neovim tarball.
+editors_neovim_tarball_tools_by_family:
+  Gentoo: []                           # tar + gzip are in @system
+  Debian: [tar, gzip, ca-certificates]
+  RedHat: [tar, gzip]
+  Archlinux: [tar, gzip]
+
+# uname -m -> the arch token in Neovim's release asset names (nvim-linux-<arch>.tar.gz).
+editors_neovim_arch_map:
+  x86_64: x86_64
+  amd64: x86_64
+  aarch64: arm64
+  arm64: arm64

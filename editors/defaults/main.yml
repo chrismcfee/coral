@@ -1,0 +1,125 @@
+---
+# =============================================================================
+# Who the editor CONFIGURATION belongs to
+# =============================================================================
+# Editor packages are system-wide; configuration (~/.config/nvim, Doom, …) is per user. When this
+# role runs in the same play as the `paseo` role it follows that role's daemon user, so the
+# editors are set up for the account your agents and Paseo terminals run as. Used standalone, set
+# these yourself. They are only REQUIRED when you ask for a config or Doom to be deployed —
+# installing just the packages needs no user at all.
+editors_user: "{{ paseo_user | default('') }}"
+editors_group: "{{ paseo_group | default(editors_user) }}"
+editors_home: "{{ paseo_home_dir | default('') }}"
+
+# Role-owned markers ("this config was bootstrapped successfully") live here, never inside the
+# config directories themselves — those may be git checkouts you don't want polluted.
+editors_state_dir: "{{ editors_home }}/.local/state/coral-editors"
+# Ceiling, in seconds, for one plugin/package bootstrap (Neovim's headless install, `doom
+# install`). These download and compile a lot; a hang should fail the task, not the whole evening.
+editors_bootstrap_timeout: 3600
+
+# =============================================================================
+# Shared tooling
+# =============================================================================
+# git + ripgrep + fd: hard requirements of Doom Emacs (git, ripgrep) and of essentially every
+# modern Neovim config (git to fetch plugins, ripgrep/fd for search). Installed once for both
+# editors. Set false if you manage these yourself.
+editors_install_support_tools: true
+# Extra distro packages to install alongside, named as THIS host's package manager knows them
+# (a C compiler for nvim-treesitter, language servers, …). Set per host or group — names differ
+# across distros, which is exactly why this is a free-form list and not a curated map.
+editors_extra_packages: []
+
+# If the editor's binary is already on PATH, don't install a package for it. This is what stops
+# the role fighting an install it didn't make: Arch's `emacs-nox` conflicts with a `emacs` you
+# already have, and a hand-installed Neovim would otherwise gain a second, older distro copy.
+# Set false to always install the configured packages.
+editors_skip_if_present: true
+
+# Package lists, as a plain list for THIS host's distro. Empty = the role's per-family default
+# (vars/main.yml): neovim; the headless emacs-nox build; git + ripgrep + fd.
+editors_neovim_packages: []
+editors_emacs_packages: []               # e.g. [emacs-wayland] for a GUI build on a workstation
+editors_support_packages: []
+
+# =============================================================================
+# Neovim
+# =============================================================================
+editors_install_neovim: false
+
+# Empty = the distro package. Fine on Gentoo/Fedora/Arch; on Debian/Ubuntu it is usually too old
+# for current configs (Debian 12 ships 0.7, LazyVim needs >= 0.11.2).
+# Set a version, e.g. "0.12.6", to install Neovim's OFFICIAL release tarball instead: identical on
+# every distro, pinnable, and independent of what the distro ships. It needs glibc and x86_64 or
+# aarch64; releases older than 0.10.4 used a different asset name and are not supported.
+editors_neovim_version: ""
+editors_neovim_release_url: "https://github.com/neovim/neovim/releases/download"
+editors_neovim_install_root: /opt        # unpacked to <root>/nvim-<version>, symlinked into /usr/local/bin
+# Optional integrity check for the tarball, e.g. "sha256:474430d5…". The digest is published per
+# asset on the GitHub release. Empty = trust TLS only.
+editors_neovim_checksum: ""
+# Fail the play if the resulting `nvim` is older than this (e.g. "0.11.2"). Version-gates the same
+# way the paseo role gates Node: better a clear message now than a config that errors at startup.
+editors_neovim_min_version: ""
+
+# --- configuration (pick ONE source, or neither) -----------------------------------------------
+# A directory on the CONTROLLER, copied to editors_neovim_config_dir. Your own config, kept next
+# to your playbooks the same way opencode.jsonc is.
+editors_neovim_config_src: ""
+# …or a git repository cloned onto the target: a starter (https://github.com/LazyVim/starter,
+# https://github.com/nvim-lua/kickstart.nvim) or your dotfiles. The target needs to reach it.
+editors_neovim_config_repo: ""
+# A branch/tag is followed only at first clone. A full 40-character commit SHA is a PIN: every
+# play converges the checkout to it. Set editors_neovim_config_update to follow a branch as well.
+editors_neovim_config_version: "HEAD"
+editors_neovim_config_update: false
+editors_neovim_config_dir: "{{ editors_home }}/.config/nvim"
+
+# After the config lands (or changes), install its plugins headlessly so the first interactive
+# start isn't a multi-minute download. The default suits lazy.nvim — LazyVim, kickstart and most
+# current configs: `install` fetches what is MISSING, at the commits in lazy-lock.json when the
+# config ships one, and never updates what is already there. That is the reproducible choice;
+# use "+Lazy! sync" if you want it to update and prune as well. A config that isn't lazy.nvim
+# based should replace this command or set editors_neovim_bootstrap: false.
+editors_neovim_bootstrap: true
+editors_neovim_bootstrap_command:
+  - nvim
+  - --headless
+  - "+Lazy! install"
+  - "+qa"
+
+# =============================================================================
+# Emacs
+# =============================================================================
+editors_install_emacs: false
+# Fail the play if `emacs` is older than this. Doom raises it by itself (see below).
+editors_emacs_min_version: ""
+
+# --- Doom Emacs --------------------------------------------------------------------------------
+# Clone Doom and run its installer for editors_user. Slow the first time: it downloads and
+# byte-compiles a hundred-odd packages (minutes, and a few hundred MB under the user's home).
+editors_emacs_doom: false
+# doomemacs/doomemacs was renamed doomemacs/core; this is the URL Doom's own README now gives.
+editors_doom_repo: "https://github.com/doomemacs/core"
+# A branch is followed only at first clone. A full 40-character commit SHA is a PIN the role
+# converges every host to — do that for a fleet, since Doom pins its packages per commit and two
+# hosts on different commits run different package sets.
+editors_doom_version: "master"
+editors_doom_update: false
+editors_doom_dir: "{{ editors_home }}/.config/emacs"
+# Doom's README: the CLI alone runs on 27.1, "using Doom as a starter kit requires 29.1+".
+editors_doom_min_emacs_version: "29.1"
+
+# Your private Doom config (init.el / config.el / packages.el) — pick ONE source, or neither to
+# let `doom install` generate Doom's defaults.
+editors_doom_config_src: ""              # a directory on the controller
+editors_doom_config_repo: ""             # …or a git repository
+editors_doom_config_version: "HEAD"
+editors_doom_config_update: false
+editors_doom_config_dir: "{{ editors_home }}/.config/doom"
+
+# Passed to `doom install`. --no-env: the "envvar file" is a snapshot of the invoking shell's
+# environment, which under Ansible is sudo's — worse than useless for a daemon user. Add "--aot"
+# to native-compile everything up front (much slower install, faster first use).
+editors_doom_install_args:
+  - --no-env

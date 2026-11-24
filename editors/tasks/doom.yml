@@ -1,0 +1,140 @@
+---
+# Doom Emacs for editors_user. Written against Doom's CURRENT sources (bin/doom, bin/doom-install,
+# bin/doom-sync and the README of doomemacs/core), which differ from most write-ups you will find:
+#
+#  - the repository is doomemacs/core (doomemacs/doomemacs was renamed), and Doom's modules are
+#    now git SUBMODULES that `doom install` initializes itself;
+#  - packages and caches live INSIDE the checkout, under <doom_dir>/.local (about 260 MB and 120
+#    package repos for the default config). Doom's source marks that for removal in 3.0 in favour
+#    of XDG dirs; nothing here depends on which it is;
+#  - `doom install` asks one question (generate an envvar file?) and `doom sync` can ask another
+#    (rebuild packages?). `--force` answers yes to prompts; `--no-env` answers the first one no.
+#
+# `doom install` is documented as "idempotent and safe to reuse" and ends by running `doom sync`,
+# so it is the single entry point here: first install, a moved pin, and a changed private config
+# all go through the same command.
+
+- name: Assert Emacs is new enough for Doom
+  ansible.builtin.assert:
+    that: _editors_emacs_version is version(editors_doom_min_emacs_version, '>=')
+    fail_msg: >-
+      Doom Emacs needs Emacs {{ editors_doom_min_emacs_version }}+ as a starter kit, but the host
+      has {{ _editors_emacs_version | default('?', true) }}.
+    quiet: true
+  when: _editors_emacs_version | default('') | length > 0
+
+# Emacs prefers ~/.emacs, ~/.emacs.el and ~/.emacs.d over ~/.config/emacs. If one exists, Doom is
+# installed correctly and then never loaded — which looks exactly like a broken install.
+- name: Check for a legacy init that would shadow Doom
+  ansible.builtin.stat:
+    path: "{{ editors_home }}/{{ item }}"
+  loop:
+    - .emacs
+    - .emacs.el
+    - .emacs.d
+  register: _editors_doom_shadow
+
+- name: Warn when a legacy Emacs init shadows Doom
+  ansible.builtin.debug:
+    msg: >-
+      *** {{ _editors_doom_shadow.results | selectattr('stat.exists') | map(attribute='stat.path') | join(', ') }}
+      exists. Emacs loads that in preference to {{ editors_doom_dir }}, so Doom will be installed
+      but NOT used until it is moved out of the way. The role does not delete it for you.
+  when: _editors_doom_shadow.results | selectattr('stat.exists') | list | length > 0
+
+# Same dry-run guard as config_source.yml: under --check on a host with no git yet, skip the clone
+# rather than fail on the missing binary.
+- name: Look for git (Doom)
+  ansible.builtin.shell: command -v git
+  environment:
+    PATH: "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+  register: _editors_doom_git_which
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+# depth 1 for a branch (what Doom's README does). A commit SHA can't be shallow-cloned by name, so
+# a pin takes a normal clone; `update` then converges to it on every play.
+# recursive: false — `doom install` runs `git submodule update -f --init --recursive` itself, and
+# two tools managing the same submodules is one too many.
+- name: Clone Doom Emacs
+  ansible.builtin.git:
+    repo: "{{ editors_doom_repo }}"
+    dest: "{{ editors_doom_dir }}"
+    version: "{{ editors_doom_version }}"
+    depth: "{{ omit if (editors_doom_version is match('^[0-9a-f]{40}$')) else 1 }}"
+    recursive: false
+    update: "{{ (editors_doom_update | bool) or (editors_doom_version is match('^[0-9a-f]{40}$')) }}"
+  environment:
+    HOME: "{{ editors_home }}"
+    GIT_TERMINAL_PROMPT: "0"
+  become: true
+  become_user: "{{ editors_user }}"
+  register: _editors_doom_git
+  when: not (ansible_check_mode and _editors_doom_git_which.rc != 0)
+
+- name: Put the private Doom config in place
+  ansible.builtin.include_tasks: config_source.yml
+  vars:
+    _cfg_label: Doom config
+    _cfg_dest: "{{ editors_doom_config_dir }}"
+    _cfg_src: "{{ editors_doom_config_src }}"
+    _cfg_repo: "{{ editors_doom_config_repo }}"
+    _cfg_version: "{{ editors_doom_config_version }}"
+    _cfg_update: "{{ editors_doom_config_update }}"
+  when: (editors_doom_config_src | length > 0) or (editors_doom_config_repo | length > 0)
+
+- name: Remember whether Doom or its config changed
+  ansible.builtin.set_fact:
+    _editors_doom_changed: >-
+      {{ (_editors_doom_git is changed)
+         or (((editors_doom_config_src | length > 0) or (editors_doom_config_repo | length > 0))
+             and (_editors_cfg_changed | default(false) | bool)) }}
+
+- name: Ensure the role's marker dir exists
+  ansible.builtin.file:
+    path: "{{ editors_state_dir }}"
+    state: directory
+    owner: "{{ editors_user }}"
+    group: "{{ editors_group }}"
+    mode: "0755"
+
+- name: Check for a completed Doom install
+  ansible.builtin.stat:
+    path: "{{ editors_state_dir }}/doom-install.done"
+  register: _editors_doom_marker
+
+# Dropped BEFORE the run, so a sync that dies halfway (network, OOM) can't leave a stale "done"
+# behind — the next play retries instead of trusting it.
+- name: Clear the Doom marker before re-running
+  ansible.builtin.file:
+    path: "{{ editors_state_dir }}/doom-install.done"
+    state: absent
+  when: _editors_doom_changed | bool
+
+# DOOMDIR is passed explicitly so the install and editors_doom_config_dir can't disagree.
+# PATH must reach emacs, git and ripgrep; nothing here depends on the daemon's PATH.
+- name: Install / sync Doom Emacs (slow on first run)
+  ansible.builtin.command:
+    argv: "{{ [editors_doom_dir ~ '/bin/doom', '--force', 'install'] + editors_doom_install_args }}"
+  environment:
+    HOME: "{{ editors_home }}"
+    DOOMDIR: "{{ editors_doom_config_dir }}"
+    PATH: "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+    GIT_TERMINAL_PROMPT: "0"
+  become: true
+  become_user: "{{ editors_user }}"
+  register: _editors_doom_install
+  changed_when: true
+  timeout: "{{ editors_bootstrap_timeout }}"
+  when: (_editors_doom_changed | bool) or (not _editors_doom_marker.stat.exists)
+
+# Records which Doom commit this host was last synced at — handy when hosts disagree.
+- name: Mark the Doom install complete
+  ansible.builtin.copy:
+    content: "{{ _editors_doom_git.after | default('unknown') }}\n"
+    dest: "{{ editors_state_dir }}/doom-install.done"
+    owner: "{{ editors_user }}"
+    group: "{{ editors_group }}"
+    mode: "0644"
+  when: _editors_doom_install is not skipped

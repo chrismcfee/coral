@@ -19,12 +19,15 @@
     _paseo_selinux_dirs: >-
       {{ ([paseo_npm_prefix]
           + ([paseo_opencode_install_dir ~ '/bin'] if paseo_install_opencode | bool else [])
-          + ([paseo_claude_bin_dir, paseo_claude_install_dir] if paseo_install_claude | bool else [])) }}
+          + ([paseo_claude_bin_dir, paseo_claude_install_dir] if paseo_install_claude | bool else [])
+          + ([paseo_kimicode_bin_dir] if paseo_install_kimicode | bool else [])) | unique }}
 
 # Only each agent's bin/ (the launched binary) — the rest of the agent's tree stays writable
 # (var_lib_t). Claude Code is the exception: its launcher is a symlink into
 # ~/.local/share/claude/versions/, and SELinux resolves the TARGET's label on exec, so the version
-# store needs bin_t too or the exec is denied despite a correctly-labeled symlink.
+# store needs bin_t too or the exec is denied despite a correctly-labeled symlink. Kimi Code is the
+# simple case: a real file in <install_dir>/bin, so only that directory is labeled and its data
+# dir next door (config.toml, credentials, sessions) keeps the writable var_lib_t.
 - name: Label the Paseo CLI prefix and agent binaries as bin_t
   community.general.sefcontext:
     target: "{{ item }}(/.*)?"

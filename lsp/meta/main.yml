@@ -1,0 +1,39 @@
+---
+galaxy_info:
+  role_name: lsp
+  namespace: homelab
+  author: homelab
+  description: >-
+    Install language servers system-wide — pyright and ruff for Python, rust-analyzer with a
+    matching toolchain for Rust — across Gentoo, Debian/Ubuntu, Fedora/RHEL and Arch, and verify
+    each one with a real LSP handshake. One install serves Neovim, Emacs, OpenCode and Claude
+    Code alike; no dependency on the paseo or editors roles.
+  license: MIT
+  min_ansible_version: "2.14"
+  platforms:
+    - name: Gentoo
+    - name: Debian
+      versions:
+        - all
+    - name: Ubuntu
+      versions:
+        - all
+    - name: Fedora
+      versions:
+        - all
+    - name: EL
+      versions:
+        - all
+    - name: Archlinux
+  galaxy_tags:
+    - lsp
+    - languageserver
+    - python
+    - pyright
+    - ruff
+    - rust
+    - rustanalyzer
+    - devenv
+    - homelab
+
+dependencies: []

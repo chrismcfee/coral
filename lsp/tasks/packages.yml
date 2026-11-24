@@ -1,0 +1,40 @@
+---
+# Install the list `_lsp_pkgs` with the host's own package manager. Included (not imported) so
+# each caller passes its own list; `_lsp_pkg_label` only makes the task names readable.
+#
+# One task per family, matching the paseo and editors roles: the generic `package` module can't
+# drive portage, and Debian needs a cache refresh the others don't.
+
+- name: "Install {{ _lsp_pkg_label }} (Gentoo)"
+  community.general.portage:
+    package: "{{ _lsp_pkgs }}"
+    state: present
+  when:
+    - ansible_facts['os_family'] == 'Gentoo'
+    - _lsp_pkgs | length > 0
+
+- name: "Install {{ _lsp_pkg_label }} (Debian/Ubuntu)"
+  ansible.builtin.apt:
+    name: "{{ _lsp_pkgs }}"
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+  when:
+    - ansible_facts['os_family'] == 'Debian'
+    - _lsp_pkgs | length > 0
+
+- name: "Install {{ _lsp_pkg_label }} (Fedora/RHEL)"
+  ansible.builtin.package:
+    name: "{{ _lsp_pkgs }}"
+    state: present
+  when:
+    - ansible_facts['os_family'] == 'RedHat'
+    - _lsp_pkgs | length > 0
+
+- name: "Install {{ _lsp_pkg_label }} (Arch)"
+  community.general.pacman:
+    name: "{{ _lsp_pkgs }}"
+    state: present
+  when:
+    - ansible_facts['os_family'] == 'Archlinux'
+    - _lsp_pkgs | length > 0

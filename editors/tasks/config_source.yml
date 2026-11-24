@@ -1,0 +1,101 @@
+---
+# Put ONE config directory in place, from either source. Shared by Neovim and Doom so there is a
+# single implementation to get right. The caller passes:
+#   _cfg_label    human name for task titles
+#   _cfg_dest     directory on the target
+#   _cfg_src      directory on the controller ('' = unused)
+#   _cfg_repo     git URL ('' = unused)
+#   _cfg_version  branch / tag / commit for the git source
+#   _cfg_update   follow a branch on every play (a 40-char SHA always converges regardless)
+# and reads back `_editors_cfg_changed` (did anything land this run?).
+#
+# The git clone runs AS editors_user, so ownership is right by construction and git never trips
+# over its "dubious ownership" check later. The controller copy runs as root with explicit
+# owner/group instead: it moves many small files, and doing that through an unprivileged become
+# needs ACL support on the target for every one of them.
+
+- name: "Reset the change flag ({{ _cfg_label }})"
+  ansible.builtin.set_fact:
+    _editors_cfg_changed: false
+
+- name: "Ensure the parent of the {{ _cfg_label }} dir exists"
+  ansible.builtin.file:
+    path: "{{ _cfg_dest | dirname }}"
+    state: directory
+    owner: "{{ editors_user }}"
+    group: "{{ editors_group }}"
+    mode: "0755"
+
+# ---- source A: a directory on the controller ---------------------------------------------------
+- name: "Deploy the {{ _cfg_label }} from the controller"
+  when: _cfg_src | length > 0
+  block:
+    - name: "Pre-flight — {{ _cfg_label }} source exists on the controller"
+      ansible.builtin.stat:
+        path: "{{ _cfg_src }}"
+      delegate_to: localhost
+      become: false
+      register: _editors_cfg_src_stat
+
+    - name: "Require the {{ _cfg_label }} source directory"
+      ansible.builtin.assert:
+        that:
+          - _editors_cfg_src_stat.stat.exists
+          - _editors_cfg_src_stat.stat.isdir | default(false)
+        fail_msg: "{{ _cfg_label }}: {{ _cfg_src }} is not a directory on the controller."
+        quiet: true
+
+    # Trailing slash => copy the directory's CONTENTS into dest. Additive by design: a file you
+    # delete from the source is not removed on the target (no rsync dependency, and it can't
+    # wipe a plugin's own state that lives next to your files).
+    - name: "Copy the {{ _cfg_label }}"
+      ansible.builtin.copy:
+        src: "{{ _cfg_src | regex_replace('/+$', '') }}/"
+        dest: "{{ _cfg_dest }}/"
+        owner: "{{ editors_user }}"
+        group: "{{ editors_group }}"
+        mode: preserve
+        directory_mode: "0755"
+      register: _editors_cfg_copy
+
+    - name: "Record whether the {{ _cfg_label }} changed"
+      ansible.builtin.set_fact:
+        _editors_cfg_changed: "{{ _editors_cfg_copy is changed }}"
+
+# ---- source B: a git repository ----------------------------------------------------------------
+# Under --check on a host that has no git yet (the package install above is a no-op in a dry
+# run), the git module can only fail. Skip the clone in exactly that case; with git present the
+# module's own check mode reports whether the checkout would move.
+- name: "Look for git ({{ _cfg_label }})"
+  ansible.builtin.shell: command -v git
+  environment:
+    PATH: "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+  register: _editors_cfg_git_which
+  changed_when: false
+  failed_when: false
+  check_mode: false
+  when: _cfg_repo | length > 0
+
+# update: a branch name is only followed when asked (first-clone-latest, then left alone — the
+# same contract as OpenCode's installer in the paseo role); a full commit SHA is a pin, so it is
+# always converged to. That keeps "what version is this host on" answerable from the inventory.
+- name: "Clone the {{ _cfg_label }}"
+  ansible.builtin.git:
+    repo: "{{ _cfg_repo }}"
+    dest: "{{ _cfg_dest }}"
+    version: "{{ _cfg_version }}"
+    update: "{{ (_cfg_update | bool) or (_cfg_version is match('^[0-9a-f]{40}$')) }}"
+  environment:
+    HOME: "{{ editors_home }}"
+    GIT_TERMINAL_PROMPT: "0"
+  become: true
+  become_user: "{{ editors_user }}"
+  register: _editors_cfg_git
+  when:
+    - _cfg_repo | length > 0
+    - not (ansible_check_mode and _editors_cfg_git_which.rc != 0)
+
+- name: "Record whether the {{ _cfg_label }} changed (git)"
+  ansible.builtin.set_fact:
+    _editors_cfg_changed: "{{ _editors_cfg_git is changed }}"
+  when: _cfg_repo | length > 0

@@ -1,0 +1,204 @@
+---
+# Functional check of the language servers on an already-provisioned host. Changes nothing: the
+# sample projects live in a scratch directory that is removed again.
+#
+#     ansible-playbook -i inventory.yml test-lsp.yml        --limit <host>   # provision first
+#     ansible-playbook -i inventory.yml test-lsp-verify.yml --limit <host>
+#
+# The role's own check is a handshake. This goes further and asks each server for what an editor
+# would actually show you, with the server running as an ordinary user (lsp_test_user):
+#
+#   pyright        a type error is reported, and go-to-definition on os.path.join lands in the
+#                  bundled typeshed stubs
+#   ruff           an unused import is flagged (F401)
+#   rust-analyzer  a type error is reported — by `cargo check`, so cargo and rustc work — and
+#                  go-to-definition on Vec lands in the standard library's source, i.e. rust-src
+#                  is installed AND found
+#
+# Check fewer servers with e.g.   -e '{"lsp_test_servers": ["rust-analyzer"]}'
+- name: Language server functional check
+  hosts: all
+  become: true
+  vars:
+    lsp_test_servers: [pyright, ruff, rust-analyzer]
+    lsp_test_user: nobody
+    lsp_test_timeout: 300          # rust-analyzer indexes the whole standard library first
+    lsp_test_path: "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+    _probe_python: "{{ ansible_facts['python']['executable'] | default('python3', true) }}"
+  tasks:
+    - name: Create a scratch workspace
+      ansible.builtin.tempfile:
+        state: directory
+        prefix: lsp-verify.
+      register: _ws
+      changed_when: false
+
+    - name: Run the checks
+      block:
+        - name: Lay out the sample projects
+          ansible.builtin.file:
+            path: "{{ _ws.path }}/{{ item }}"
+            state: directory
+            mode: "0755"
+          loop: [home, py, crate, crate/src]
+          changed_when: false
+
+        # Line 2: an unused import (ruff F401). Line 4: a str assigned to an int (pyright).
+        # Line 5, column 16: `join`, whose definition is in typeshed's posixpath.pyi.
+        - name: Write the Python sample
+          ansible.builtin.copy:
+            dest: "{{ _ws.path }}/py/sample.py"
+            mode: "0644"
+            content: |
+              import os
+              import sys
+
+              count: int = "three"
+              print(os.path.join("a", str(count)))
+          changed_when: false
+
+        - name: Write the Rust sample manifest
+          ansible.builtin.copy:
+            dest: "{{ _ws.path }}/crate/Cargo.toml"
+            mode: "0644"
+            content: |
+              [package]
+              name = "lsp-verify"
+              version = "0.1.0"
+              edition = "2021"
+          changed_when: false
+
+        # Line 2, column 16: `Vec`, defined in the standard library. Line 3: a &str assigned to
+        # a u32.
+        - name: Write the Rust sample source
+          ansible.builtin.copy:
+            dest: "{{ _ws.path }}/crate/src/main.rs"
+            mode: "0644"
+            content: |
+              fn main() {
+                  let items: Vec<u8> = Vec::new();
+                  let count: u32 = "three";
+                  println!("{} {}", items.len(), count);
+              }
+          changed_when: false
+
+        # The servers run as lsp_test_user and cargo writes target/ and its own home there.
+        - name: Hand the workspace to the test user
+          ansible.builtin.file:
+            path: "{{ _ws.path }}"
+            state: directory
+            owner: "{{ lsp_test_user }}"
+            recurse: true
+            mode: "u=rwX,go=rX"
+          changed_when: false
+
+        - name: Ask pyright for a type error and a definition
+          ansible.builtin.script:
+            cmd: >-
+              lsp/files/lsp-probe.py --user {{ lsp_test_user | quote }}
+              --root {{ _ws.path }}/py --home {{ _ws.path }}/home
+              --open {{ _ws.path }}/py/sample.py
+              --expect-diagnostic 'assign'
+              --definition 5:16 --expect-definition 'posixpath[.]pyi?$'
+              --timeout {{ lsp_test_timeout }} -- pyright-langserver --stdio
+            executable: "{{ _probe_python }}"
+          environment:
+            PATH: "{{ lsp_test_path }}"
+          register: _pyright
+          changed_when: false
+          failed_when: false
+          when: "'pyright' in lsp_test_servers"
+
+        - name: Ask ruff for a lint finding
+          ansible.builtin.script:
+            cmd: >-
+              lsp/files/lsp-probe.py --user {{ lsp_test_user | quote }}
+              --root {{ _ws.path }}/py --home {{ _ws.path }}/home
+              --open {{ _ws.path }}/py/sample.py
+              --expect-diagnostic 'F401'
+              --timeout {{ lsp_test_timeout }} -- ruff server
+            executable: "{{ _probe_python }}"
+          environment:
+            PATH: "{{ lsp_test_path }}"
+          register: _ruff
+          changed_when: false
+          failed_when: false
+          when: "'ruff' in lsp_test_servers"
+
+        - name: Ask rust-analyzer for a type error and a definition in std
+          ansible.builtin.script:
+            cmd: >-
+              lsp/files/lsp-probe.py --user {{ lsp_test_user | quote }}
+              --root {{ _ws.path }}/crate --home {{ _ws.path }}/home
+              --open {{ _ws.path }}/crate/src/main.rs
+              --expect-diagnostic 'mismatched types|expected .?u32'
+              --definition 2:16 --expect-definition 'library/alloc/src/vec/'
+              --timeout {{ lsp_test_timeout }} -- rust-analyzer
+            executable: "{{ _probe_python }}"
+          environment:
+            PATH: "{{ lsp_test_path }}"
+          register: _rust
+          changed_when: false
+          failed_when: false
+          when: "'rust-analyzer' in lsp_test_servers"
+
+        # The probe prints one JSON object; the search keeps a stray line from breaking from_json.
+        # ([{] not a backslash-escaped brace: backslashes in Jinja string literals are not
+        # portable across Ansible versions.)
+        - name: Collect the reports
+          ansible.builtin.set_fact:
+            _lsp_results: >-
+              {%- set out = [] -%}
+              {%- for name, raw in [('pyright', _pyright), ('ruff', _ruff), ('rust-analyzer', _rust)] -%}
+              {%-   if name in lsp_test_servers -%}
+              {%-     set text = raw.stdout | default('') | regex_search('(?s)[{].*[}]') | default('{}', true) -%}
+              {%-     set r = text | from_json -%}
+              {%-     set line = [name ~ ':', 'OK' if (r.ok | default(false)) else 'FAILED',
+                                  'in ' ~ (r.seconds | default('?')) ~ 's as ' ~ (r.user | default('?'))] -%}
+              {%-     if r.server is defined and r.server.name is defined -%}
+              {%-       set _ = line.append('(' ~ r.server.name ~ ' ' ~ (r.server.version | default('')) ~ ')') -%}
+              {%-     endif -%}
+              {%-     for d in (r.diagnostics | default([])) -%}
+              {%-       set _ = line.append('| line ' ~ d.line ~ ': ' ~ (d.text | split | join(' '))) -%}
+              {%-     endfor -%}
+              {%-     if r.definition | default([]) | length > 0 -%}
+              {%-       set _ = line.append('| definition -> ' ~ (r.definition | unique | join(', '))) -%}
+              {%-     endif -%}
+              {%-     if r.error is defined -%}
+              {%-       set _ = line.append('| ' ~ r.error) -%}
+              {%-     endif -%}
+              {%-     if r.stderr | default([]) | length > 0 -%}
+              {%-       set _ = line.append('| server said: ' ~ (r.stderr | join(' / '))) -%}
+              {%-     endif -%}
+              {%-     if r.status is defined and not (r.ok | default(false)) -%}
+              {%-       set _ = line.append('| status: ' ~ (r.status | to_json)) -%}
+              {%-     endif -%}
+              {%-     set _ = out.append({'name': name, 'ok': (r.ok | default(false)),
+                                          'summary': (line | join(' ')),
+                                          'error': (r.error | default('no report — is it installed and on PATH?'))}) -%}
+              {%-   endif -%}
+              {%- endfor -%}
+              {{ out }}
+
+        # One line per server, pass or fail, before any assert stops the play.
+        - name: Report
+          ansible.builtin.debug:
+            msg: "{{ item.summary }}"
+          loop: "{{ _lsp_results }}"
+          loop_control:
+            label: "{{ item.name }}"
+
+        - name: Require every checked server to pass
+          ansible.builtin.assert:
+            that: item.ok | bool
+            fail_msg: "{{ item.name }} failed its functional check: {{ item.error }}"
+            quiet: true
+          loop: "{{ _lsp_results }}"
+          loop_control:
+            label: "{{ item.name }}"
+      always:
+        - name: Remove the scratch workspace
+          ansible.builtin.file:
+            path: "{{ _ws.path }}"
+            state: absent
+          changed_when: false

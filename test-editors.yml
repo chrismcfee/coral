@@ -1,0 +1,28 @@
+---
+# Smoke test for the `editors` role on ONE host. Run from the repo root:
+#
+#     ansible-playbook -i inventory.yml test-editors.yml --limit <host> --check   # dry run first
+#     ansible-playbook -i inventory.yml test-editors.yml --limit <host>
+#
+# As written this installs only the PACKAGES (Neovim, Emacs, git, ripgrep, fd) — fast, and it needs
+# no user. To exercise the per-user paths as well, add the pieces you want:
+#
+#   Doom Emacs for a user (slow: several minutes on first run):
+#     -e '{"editors_user": "paseo", "editors_home": "/var/lib/paseo", "editors_emacs_doom": true}'
+#
+#   A Neovim config from git, with plugins installed headlessly (LazyVim needs Neovim >= 0.11.2
+#   and a C compiler for nvim-treesitter — name the compiler package for the host's distro):
+#     -e '{"editors_user": "paseo", "editors_home": "/var/lib/paseo",
+#          "editors_neovim_config_repo": "https://github.com/LazyVim/starter",
+#          "editors_neovim_min_version": "0.11.2", "editors_extra_packages": ["gcc"]}'
+#
+#   The official Neovim build instead of the distro's (what Debian/Ubuntu hosts usually need):
+#     -e editors_neovim_version=0.12.6
+- name: Editors smoke test
+  hosts: all
+  become: true
+  vars:
+    editors_install_neovim: true
+    editors_install_emacs: true
+  roles:
+    - editors

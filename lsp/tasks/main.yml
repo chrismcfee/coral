@@ -1,0 +1,37 @@
+---
+# Language servers for a dev host: Python (pyright, ruff) and Rust (rust-analyzer + toolchain).
+# Everything is opt-in — with the defaults this role does nothing at all, so it is safe to list
+# in a fleet play and switch on per host or group.
+#
+# All of it is system-wide: packages, root-owned trees under lsp_install_root, and links in
+# lsp_bin_dir. There is no per-user state, so the role needs no user and no other role.
+
+- name: Validate inputs
+  ansible.builtin.assert:
+    that:
+      - lsp_python_servers | difference(['pyright', 'ruff']) | length == 0
+      - lsp_pyright_package in lsp_pyright_flavours
+      - lsp_bin_dir is match('/')
+      - lsp_install_root is match('/')
+      - lsp_rust_components | length > 0
+    fail_msg: >-
+      Check vars: lsp_python_servers takes 'pyright' and/or 'ruff'; lsp_pyright_package is one of
+      {{ lsp_pyright_flavours | join(', ') }}; lsp_bin_dir and lsp_install_root are absolute paths;
+      lsp_rust_components must not be empty (it is what puts rust-analyzer in the toolchain).
+    quiet: true
+  when: (lsp_install_python | bool) or (lsp_install_rust | bool)
+
+- name: Ensure the command dir exists
+  ansible.builtin.file:
+    path: "{{ lsp_bin_dir }}"
+    state: directory
+    mode: "0755"
+  when: (lsp_install_python | bool) or (lsp_install_rust | bool)
+
+- name: Set up the Python language servers
+  ansible.builtin.import_tasks: python.yml
+  when: lsp_install_python | bool
+
+- name: Set up Rust (toolchain + rust-analyzer)
+  ansible.builtin.import_tasks: rust.yml
+  when: lsp_install_rust | bool

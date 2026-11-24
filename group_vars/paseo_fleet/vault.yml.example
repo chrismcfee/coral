@@ -29,6 +29,11 @@ paseo_opencode_secrets:
 #     type: "api"
 #     key: "..."
 
+# NOTE on key names in ANY of these dicts: don't use the daemon's own setting names
+# (PASEO_PASSWORD, PASEO_LISTEN, PASEO_HOSTNAMES, PORT, …). The daemon reads its settings from the
+# same environment, so it would act on them instead of handing them to the agent. PASEO_TOKEN above
+# is fine — it means nothing to the daemon.
+
 # Optional: Claude Code credentials, only when paseo_install_claude is true. Merged with
 # paseo_opencode_secrets into the SAME /etc/paseo/paseo.env, so key names must not collide.
 # paseo_claude_secrets:
@@ -40,3 +45,21 @@ paseo_opencode_secrets:
 # paseo_claude_secrets:
 #   ANTHROPIC_BASE_URL: "http://127.0.0.1:4000"
 #   ANTHROPIC_AUTH_TOKEN: ""
+
+# Optional: Kimi Code credentials, only when paseo_install_kimicode is true. Same env file again,
+# so key names must not collide with the dicts above.
+#
+# Kimi Code does NOT read a bare KIMI_API_KEY / MOONSHOT_API_KEY from the environment. The
+# env-only path is the KIMI_MODEL_* family, and KIMI_MODEL_NAME is what switches it on:
+# paseo_kimicode_secrets:
+#   KIMI_MODEL_NAME: "kimi-for-coding"                      # the model id your endpoint serves
+#   KIMI_MODEL_API_KEY: ""
+#   KIMI_MODEL_BASE_URL: "https://api.kimi.com/coding/v1"   # omit for https://api.moonshot.ai/v1
+#
+# Or keep the key under a name of your choosing and reference it from a sanitized config.toml
+# (`api_key_env = "MY_KIMI_KEY"`), seeded with paseo_kimicode_config_src:
+# paseo_kimicode_secrets:
+#   MY_KIMI_KEY: ""
+#
+# A Kimi Code subscription (OAuth) needs nothing here: log the daemon user in once per host with
+#   sudo -u paseo env HOME=/var/lib/paseo /var/lib/paseo/.kimi-code/bin/kimi login

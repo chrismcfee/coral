@@ -83,7 +83,10 @@
 
 - name: Register Claude Code with Paseo (agents.providers.claude)
   ansible.builtin.copy:
-    content: >-
+    # `>` (not `>-`): keep the block's trailing newline, so this writes byte-for-byte what
+    # config.yml writes for the same data. Without it the two tasks flip the file on every play
+    # and each flip restarts the daemon.
+    content: >
       {{ ((_paseo_cc_cfg_raw.content | b64decode | from_json)
             if (_paseo_cc_cfg_raw.content is defined
                 and (_paseo_cc_cfg_raw.content | length) > 0)
